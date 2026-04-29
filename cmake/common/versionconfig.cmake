@@ -77,3 +77,10 @@ unset(_obs_version_canonical)
 unset(_obs_release_candidate)
 unset(_obs_beta)
 unset(_obs_version_result)
+
+# Pulsar fork build identifier. Suffixes the display version so any
+# binary produced from this fork is observable as such at runtime
+# (About dialog, log preamble, window title). Does not touch
+# OBS_VERSION_CANONICAL because that drives target VERSION/SOVERSION
+# which expects strict MAJOR.MINOR.PATCH.
+set(OBS_VERSION "${OBS_VERSION}-pulsar")
