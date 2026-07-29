@@ -409,6 +409,13 @@ static bool nvidia_audio_initialize_internal(void *data)
 			}
 
 			// Set AI models path
+			/* Pulsar #167: set_nv_model() leaves this NULL when the
+			 * .trtpkg is not where it must be. Stop here rather
+			 * than hand the SDK a null path. */
+			if (!ng->model) {
+				do_log(LOG_ERROR, "no verified model file; FX not initialized");
+				goto failure;
+			}
 			err = NvAFX_SetString(ng->handle[i], NVAFX_PARAM_MODEL_PATH, ng->model);
 			if (err != NVAFX_STATUS_SUCCESS) {
 				do_log(LOG_ERROR, "NvAFX_SetString() failed, error %i", err);
@@ -514,23 +521,47 @@ static inline enum speaker_layout nv_convert_speaker_layout(uint8_t channels)
 	}
 }
 
+/* Pulsar #167 -- the model path is a LOAD, not a string.
+ *
+ * NvAFX_SetString(NVAFX_PARAM_MODEL_PATH) hands this path to the SDK, which
+ * DESERIALISES it as a TensorRT package: a model of uncontrolled origin is
+ * an execution surface. Upstream concatenated ng->sdk_path (straight from
+ * the environment) with a fixed name and never checked the result existed.
+ *
+ * Now: ng->sdk_path can only be a directory pulsar_nv_validate_dir()
+ * admitted, the leaf is confined to <dir>\models\ by pulsar_nv_join_w()
+ * (which refuses a separator in the leaf), and the file must be there
+ * before the path is handed over. All three model files are covered, not
+ * just the denoiser default -- the effect method chooses among them at
+ * runtime, so checking one would leave the other two unverified.
+ *
+ * ng->model stays NULL when the file is absent; the caller's
+ * NvAFX_SetString then fails loudly instead of the SDK being pointed at
+ * something that is not there. */
 static void set_nv_model(void *data, const char *method)
 {
 	struct nvidia_audio_data *ng = data;
-	const char *file;
+	const char *leaf;
 
 	if (strcmp(NVAFX_EFFECT_DEREVERB, method) == 0)
-		file = NVAFX_EFFECT_DEREVERB_MODEL;
+		leaf = pulsar_nv_afx_models[1];
 	else if (strcmp(NVAFX_EFFECT_DEREVERB_DENOISER, method) == 0)
-		file = NVAFX_EFFECT_DEREVERB_DENOISER_MODEL;
+		leaf = pulsar_nv_afx_models[2];
 	else
-		file = NVAFX_EFFECT_DENOISER_MODEL;
+		leaf = pulsar_nv_afx_models[0];
 
-	size_t size = strlen(ng->sdk_path) + strlen(file) + 1;
+	bfree(ng->model);
+	ng->model = NULL;
+
+	if (!ng->sdk_path || !pulsar_nv_file_exists(ng->sdk_path, PULSAR_NV_MODEL_SUBDIR, leaf)) {
+		do_log(LOG_ERROR, "model %s\\%s\\%s is absent; FX disabled", ng->sdk_path ? ng->sdk_path : "(none)",
+		       PULSAR_NV_MODEL_SUBDIR, leaf);
+		return;
+	}
+
+	size_t size = strlen(ng->sdk_path) + strlen(PULSAR_NV_MODEL_SUBDIR) + strlen(leaf) + 3;
 	char *buffer = (char *)bmalloc(size);
-
-	strcpy(buffer, ng->sdk_path);
-	strcat(buffer, file);
+	snprintf(buffer, size, "%s\\%s\\%s", ng->sdk_path, PULSAR_NV_MODEL_SUBDIR, leaf);
 	ng->model = buffer;
 }
 

@@ -7,6 +7,14 @@
 #include <util/platform.h>
 #include <util/windows/win-version.h>
 #include "nv_sdk_versions.h"
+/* Pulsar #167 / Prism ADR 023 Am.3 §A3.4 -- plugins/pulsar-nv-secure-load/,
+ * wired in by this plugin's CMakeLists. Owns the directory validation, the
+ * capability probe and every LoadLibraryEx in this module. */
+#include <pulsar-nv-secure-load.h>
+
+#if MIN_AFX_SDK_VERSION != PULSAR_NV_MIN_AFX_VERSION
+#error "AFX minimum version drifted between nv_sdk_versions.h and pulsar-nv-secure-load.h"
+#endif
 
 #define NVAFX_API
 
@@ -285,26 +293,43 @@ void release_lib(void)
 	}
 }
 
+/* Pulsar #167: the directory is no longer whatever the inherited
+ * environment happens to say -- it is what pulsar_nv_probe_afx() validated,
+ * or nothing at all. Returns false when the probe was negative, which is
+ * also the state in which obs_module_load() already refused to load us. */
 static bool nvafx_get_sdk_path(char *buffer, const size_t len)
 {
-	DWORD ret = GetEnvironmentVariableA("NVAFX_SDK_DIR", buffer, (DWORD)len);
+	struct pulsar_nv_sdk_probe p;
 
-	if (!ret || ret >= len - 1)
+	if (!buffer || len < MAX_PATH)
 		return false;
 
+	pulsar_nv_probe_afx(&p);
+	if (!p.usable)
+		return false;
+
+	memcpy(buffer, p.dir, strlen(p.dir) + 1);
 	return true;
 }
 
+/* Pulsar #167 -- was:
+ *     SetDllDirectoryA(path);
+ *     nv_audiofx = LoadLibrary(L"NVAudioEffects.dll");
+ *     SetDllDirectoryA(NULL);
+ *     nv_cuda = LoadLibrary(L"nvcuda.dll");
+ * i.e. two bare-name loads, the second one under the plain standard search
+ * order, whose first entry is pulsar.exe's own directory. Both are now
+ * absolute-path loads confined by PULSAR_NV_LOAD_FLAGS, and nvcuda.dll is
+ * taken from System32 (where the display driver installs it) rather than
+ * from wherever the search happened to land. */
 static bool load_lib(void)
 {
 	char path[MAX_PATH];
 	if (!nvafx_get_sdk_path(path, sizeof(path)))
 		return false;
 
-	SetDllDirectoryA(path);
-	nv_audiofx = LoadLibrary(L"NVAudioEffects.dll");
-	SetDllDirectoryA(NULL);
-	nv_cuda = LoadLibrary(L"nvcuda.dll");
+	nv_audiofx = pulsar_nv_load_from_dir(path, PULSAR_NV_AFX_DLL);
+	nv_cuda = pulsar_nv_load_from_system32(PULSAR_NV_CUDA_DLL);
 	return !!nv_audiofx && !!nv_cuda;
 }
 
@@ -318,17 +343,14 @@ static unsigned int get_lib_version(void)
 
 	version_checked = true;
 
+	/* Pulsar #167: read off the validated directory by absolute path,
+	 * with no SetDllDirectory and no load. An unreadable resource leaves
+	 * `version` at 0 -- absent, never assumed sufficient. */
 	char path[MAX_PATH];
 	if (!nvafx_get_sdk_path(path, sizeof(path)))
 		return 0;
 
-	SetDllDirectoryA(path);
-
-	struct win_version_info nto_ver = {0};
-	if (get_dll_ver(L"NVAudioEffects.dll", &nto_ver))
-		version = nto_ver.major << 24 | nto_ver.minor << 16 | nto_ver.build << 8 | nto_ver.revis << 0;
-
-	SetDllDirectoryA(NULL);
+	pulsar_nv_read_version(path, PULSAR_NV_AFX_DLL, &version);
 	return version;
 }
 
