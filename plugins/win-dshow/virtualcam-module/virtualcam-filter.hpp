@@ -32,6 +32,7 @@ class VCamFilter : public DShow::OutputFilter {
 	std::thread th;
 
 	video_queue_t *vq = nullptr;
+	const wchar_t *queue_name;
 	int queue_mode = 0;
 	bool in_obs = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
@@ -63,7 +64,7 @@ protected:
 	const wchar_t *FilterName() const override;
 
 public:
-	VCamFilter();
+	VCamFilter(bool program_return);
 	~VCamFilter() override;
 
 	STDMETHODIMP Pause() override;

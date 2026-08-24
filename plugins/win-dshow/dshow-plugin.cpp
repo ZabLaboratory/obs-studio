@@ -17,6 +17,7 @@ extern void RegisterDShowEncoders();
 
 #ifdef VIRTUALCAM_AVAILABLE
 extern "C" struct obs_output_info virtualcam_info;
+extern "C" struct obs_output_info program_return_info;
 
 static bool vcam_installed(bool b64)
 {
@@ -47,6 +48,8 @@ bool obs_module_load(void)
 #ifdef VIRTUALCAM_AVAILABLE
 	if (vcam_installed(false))
 		obs_register_output(&virtualcam_info);
+	if (vcam_installed(false))
+		obs_register_output(&program_return_info);
 #endif
 
 	return true;

@@ -74,8 +74,8 @@ STDMETHODIMP VCamFactory::CreateInstance(LPUNKNOWN parent, REFIID, void **p_ptr)
 		return E_NOINTERFACE;
 	}
 
-	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo)) {
-		*p_ptr = (void *)new VCamFilter();
+	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) || IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo)) {
+		*p_ptr = (void *)new VCamFilter(IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo));
 		return S_OK;
 	}
 
@@ -159,8 +159,15 @@ static bool RegServers(bool reg)
 	}
 
 	if (reg) {
-		return RegServer(CLSID_OBS_VirtualVideo, L"OBS Virtual Camera", file);
+		if (!RegServer(CLSID_OBS_VirtualVideo, L"OBS Virtual Camera", file))
+			return false;
+		if (!RegServer(CLSID_PulsarProgramReturnVideo, L"Pulsar Program Return", file)) {
+			UnregServer(CLSID_OBS_VirtualVideo);
+			return false;
+		}
+		return true;
 	} else {
+		UnregServer(CLSID_PulsarProgramReturnVideo);
 		return UnregServer(CLSID_OBS_VirtualVideo);
 	}
 }
@@ -188,11 +195,18 @@ static bool RegFilters(bool reg)
 		if (FAILED(hr)) {
 			return false;
 		}
-	} else {
-		hr = fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
+		moniker = nullptr;
+		hr = fm->RegisterFilter(CLSID_PulsarProgramReturnVideo, L"Pulsar Program Return", &moniker,
+					&CLSID_VideoInputDeviceCategory, nullptr, &rf2);
 		if (FAILED(hr)) {
+			fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
 			return false;
 		}
+	} else {
+		hr = fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
+		fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_PulsarProgramReturnVideo);
+		if (FAILED(hr) && hr != VFW_E_NOT_FOUND)
+			return false;
 	}
 
 	return true;
@@ -254,7 +268,7 @@ STDAPI DllGetClassObject(REFCLSID cls, REFIID riid, void **p_ptr)
 	if (riid != IID_IClassFactory && riid != IID_IUnknown) {
 		return E_NOINTERFACE;
 	}
-	if (!IsEqualCLSID(cls, CLSID_OBS_VirtualVideo)) {
+	if (!IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) && !IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo)) {
 		return E_INVALIDARG;
 	}
 
