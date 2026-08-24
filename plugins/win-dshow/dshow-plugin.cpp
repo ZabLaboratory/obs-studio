@@ -1,9 +1,6 @@
 #include <obs-module.h>
 #include <strsafe.h>
 #include <strmif.h>
-#ifdef VIRTUALCAM_AVAILABLE
-#include "virtualcam-guid.h"
-#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("win-dshow", "en-US")
@@ -18,27 +15,6 @@ extern void RegisterDShowEncoders();
 #ifdef VIRTUALCAM_AVAILABLE
 extern "C" struct obs_output_info virtualcam_info;
 extern "C" struct obs_output_info program_return_info;
-
-static bool vcam_installed(bool b64)
-{
-	wchar_t cls_str[CHARS_IN_GUID];
-	wchar_t temp[MAX_PATH];
-	HKEY key = nullptr;
-
-	StringFromGUID2(CLSID_OBS_VirtualVideo, cls_str, CHARS_IN_GUID);
-	StringCbPrintf(temp, sizeof(temp), L"CLSID\\%s", cls_str);
-
-	DWORD flags = KEY_READ;
-	flags |= b64 ? KEY_WOW64_64KEY : KEY_WOW64_32KEY;
-
-	LSTATUS status = RegOpenKeyExW(HKEY_CLASSES_ROOT, temp, 0, flags, &key);
-	if (status != ERROR_SUCCESS) {
-		return false;
-	}
-
-	RegCloseKey(key);
-	return true;
-}
 #endif
 
 bool obs_module_load(void)
@@ -46,10 +22,13 @@ bool obs_module_load(void)
 	RegisterDShowSource();
 	RegisterDShowEncoders();
 #ifdef VIRTUALCAM_AVAILABLE
-	if (vcam_installed(false))
-		obs_register_output(&virtualcam_info);
-	if (vcam_installed(false))
-		obs_register_output(&program_return_info);
+	// The OBS outputs are producers, not COM-device discovery. Register them
+	// whenever the native virtual-output implementation is compiled in. The
+	// DirectShow module may be installed later (or on another consumer machine),
+	// while libobs must still be able to create the program-return output and
+	// publish its named shared-memory queue.
+	obs_register_output(&virtualcam_info);
+	obs_register_output(&program_return_info);
 #endif
 
 	return true;
