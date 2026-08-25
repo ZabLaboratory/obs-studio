@@ -38,7 +38,8 @@ struct video_queue {
 #define ALIGN_SIZE(size, align) size = (((size) + (align - 1)) & (~(align - 1)))
 #define FRAME_HEADER_SIZE 32
 
-video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval)
+video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_t interval,
+									 const wchar_t *name)
 {
 	struct video_queue vq = {0};
 	struct video_queue *pvq;
@@ -76,13 +77,13 @@ video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval)
 	}
 
 	/* fail if already in use */
-	vq.handle = OpenFileMappingW(FILE_MAP_READ, false, VIDEO_NAME);
+	vq.handle = OpenFileMappingW(FILE_MAP_READ, false, name);
 	if (vq.handle) {
 		CloseHandle(vq.handle);
 		return NULL;
 	}
 
-	vq.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, size, VIDEO_NAME);
+	vq.handle = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, size, name);
 	if (!vq.handle) {
 		return NULL;
 	}
@@ -108,11 +109,11 @@ video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval)
 	return pvq;
 }
 
-video_queue_t *video_queue_open()
+video_queue_t *video_queue_open_named(const wchar_t *name)
 {
 	struct video_queue vq = {0};
 
-	vq.handle = OpenFileMappingW(FILE_MAP_READ, false, VIDEO_NAME);
+	vq.handle = OpenFileMappingW(FILE_MAP_READ, false, name);
 	if (!vq.handle) {
 		return NULL;
 	}
@@ -130,6 +131,16 @@ video_queue_t *video_queue_open()
 	}
 	memcpy(pvq, &vq, sizeof(vq));
 	return pvq;
+}
+
+video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval)
+{
+	return video_queue_create_named(cx, cy, interval, VIDEO_NAME);
+}
+
+video_queue_t *video_queue_open()
+{
+	return video_queue_open_named(VIDEO_NAME);
 }
 
 void video_queue_close(video_queue_t *vq)

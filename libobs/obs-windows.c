@@ -34,16 +34,24 @@ const char *get_module_extension(void)
 	return ".dll";
 }
 
-static const char *module_bin[] = {"../../obs-plugins/64bit"};
-
-static const char *module_data[] = {"../../data/obs-plugins/%module%"};
-
-static const int module_patterns_size = sizeof(module_bin) / sizeof(module_bin[0]);
-
 void add_default_module_paths(void)
 {
-	for (int i = 0; i < module_patterns_size; i++)
-		obs_add_module_path(module_bin[i], module_data[i]);
+	/*
+	 * The headless runtime is launched from an embedded bundle and its
+	 * current working directory is an implementation detail of the parent
+	 * process. Resolve the module roots from the executable instead of
+	 * relying on that cwd. This keeps every OBS plugin, including the
+	 * program-return DirectShow producer, discoverable in Prism's local
+	 * runtime cache.
+	 */
+	char *module_bin = os_get_executable_path_ptr("../../obs-plugins/64bit");
+	char *module_data = os_get_executable_path_ptr("../../data/obs-plugins/%module%");
+
+	if (module_bin && module_data)
+		obs_add_module_path(module_bin, module_data);
+
+	bfree(module_bin);
+	bfree(module_data);
 }
 
 /* on windows, points to [base directory]/data/libobs */

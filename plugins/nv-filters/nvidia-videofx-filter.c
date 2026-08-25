@@ -263,9 +263,17 @@ static bool nvvfx_filter_create_internal(struct nvvfx_data *filter)
 	if (id == S_FX_AIGS || id == S_FX_BG_BLUR) {
 		char buffer[MAX_PATH];
 		char modelDir[MAX_PATH];
-		nvvfx_get_sdk_path(buffer, MAX_PATH);
-		size_t max_len = sizeof(buffer) / sizeof(char);
-		snprintf(modelDir, max_len, "%s\\models", buffer);
+		/* Pulsar #167: the model directory the SDK is pointed at is
+		 * derived from the VALIDATED SDK directory, never from a raw
+		 * environment read. Refuse rather than build a path under an
+		 * unvouched-for root -- NVVFX_MODEL_DIRECTORY is where the SDK
+		 * goes looking for TensorRT packages to deserialise. */
+		if (!nvvfx_get_sdk_path(buffer, MAX_PATH)) {
+			log_nverror_destroy(filter, NVCV_ERR_MODEL);
+			return false;
+		}
+		size_t max_len = sizeof(modelDir) / sizeof(char);
+		snprintf(modelDir, max_len, "%s\\%s", buffer, PULSAR_NV_MODEL_SUBDIR);
 		vfxErr = NvVFX_SetString(filter->handle, NVVFX_MODEL_DIRECTORY, modelDir);
 		vfxErr = NvVFX_SetCudaStream(filter->handle, NVVFX_CUDA_STREAM, filter->stream);
 		if (NVCV_SUCCESS != vfxErr)

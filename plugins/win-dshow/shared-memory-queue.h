@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <wchar.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,6 +22,9 @@ enum queue_state {
 
 extern video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval);
 extern video_queue_t *video_queue_open();
+extern video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_t interval,
+									 const wchar_t *name);
+extern video_queue_t *video_queue_open_named(const wchar_t *name);
 extern void video_queue_close(video_queue_t *vq);
 
 extern void video_queue_get_info(video_queue_t *vq, uint32_t *cx, uint32_t *cy, uint64_t *interval);

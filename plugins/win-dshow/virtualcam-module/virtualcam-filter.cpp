@@ -14,7 +14,8 @@ extern volatile long locks;
 
 /* ========================================================================= */
 
-VCamFilter::VCamFilter() : OutputFilter()
+VCamFilter::VCamFilter(bool program_return) : OutputFilter(),
+	queue_name(program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo")
 {
 	thread_start = CreateEvent(nullptr, true, false, nullptr);
 	thread_stop = CreateEvent(nullptr, true, false, nullptr);
@@ -46,7 +47,7 @@ VCamFilter::VCamFilter() : OutputFilter()
 	uint32_t new_obs_cy = obs_cy;
 	uint64_t new_obs_interval = obs_interval;
 
-	vq = video_queue_open();
+	vq = video_queue_open_named(queue_name);
 	if (vq) {
 		if (video_queue_state(vq) == SHARED_QUEUE_STATE_READY) {
 			video_queue_get_info(vq, &new_obs_cx, &new_obs_cy, &new_obs_interval);
@@ -210,7 +211,7 @@ void VCamFilter::Frame(uint64_t ts)
 	   filter output! */
 
 	if (!vq) {
-		vq = video_queue_open();
+			vq = video_queue_open_named(queue_name);
 	}
 
 	enum queue_state state = video_queue_state(vq);

@@ -8,6 +8,14 @@
 #include <dxgitype.h>
 #include <util/windows/win-version.h>
 #include "nv_sdk_versions.h"
+/* Pulsar #167 / Prism ADR 023 Am.3 §A3.4 -- see nvafx-load.h. Included
+ * OUTSIDE the extern "C" block below: it is a C header and must not be
+ * given C++ linkage by a translation unit that happens to be C++. */
+#include <pulsar-nv-secure-load.h>
+
+#if MIN_VFX_SDK_VERSION != PULSAR_NV_MIN_VFX_VERSION
+#error "VFX minimum version drifted between nv_sdk_versions.h and pulsar-nv-secure-load.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -667,28 +675,39 @@ static inline void release_nv_vfx()
 	}
 }
 
-static inline void nvvfx_get_sdk_path(char *buffer, const size_t len)
+/* Pulsar #167: same change as nvafx-load.h. The environment variable (and
+ * its %ProgramFiles% fallback) is now a CANDIDATE that
+ * pulsar_nv_probe_vfx() validates, not a directory taken on trust. Returns
+ * false -- rather than the old void + unchecked buffer -- so no caller can
+ * carry on with a path nobody vouched for. */
+static inline bool nvvfx_get_sdk_path(char *buffer, const size_t len)
 {
-	DWORD ret = GetEnvironmentVariableA("NV_VIDEO_EFFECTS_PATH", buffer, (DWORD)len);
+	struct pulsar_nv_sdk_probe p;
 
-	if (!ret || ret >= len - 1) {
-		char path[MAX_PATH];
-		GetEnvironmentVariableA("ProgramFiles", path, MAX_PATH);
+	if (!buffer || len < MAX_PATH)
+		return false;
 
-		size_t max_len = sizeof(path) / sizeof(char);
-		snprintf(buffer, max_len, "%s\\NVIDIA Corporation\\NVIDIA Video Effects", path);
-	}
+	pulsar_nv_probe_vfx(&p);
+	if (!p.usable)
+		return false;
+
+	memcpy(buffer, p.dir, strlen(p.dir) + 1);
+	return true;
 }
 
+/* Pulsar #167 -- was two bare-name LoadLibrary() calls under a
+ * SetDllDirectoryA() of an unvalidated path; pulsar.exe's directory beat
+ * that entry in the standard search order. Now: absolute path, confined by
+ * PULSAR_NV_LOAD_FLAGS for the DLL itself AND for its imports. */
 static inline bool load_nv_vfx_libs()
 {
 	char fullPath[MAX_PATH];
-	nvvfx_get_sdk_path(fullPath, MAX_PATH);
-	SetDllDirectoryA(fullPath);
 
-	nv_videofx = LoadLibrary(L"NVVideoEffects.dll");
-	nv_cvimage = LoadLibrary(L"NVCVImage.dll");
-	SetDllDirectoryA(NULL);
+	if (!nvvfx_get_sdk_path(fullPath, MAX_PATH))
+		return false;
+
+	nv_videofx = pulsar_nv_load_from_dir(fullPath, PULSAR_NV_VFX_DLL);
+	nv_cvimage = pulsar_nv_load_from_dir(fullPath, PULSAR_NV_CVIMAGE_DLL);
 	return !!nv_videofx && !!nv_cvimage;
 }
 
@@ -703,15 +722,10 @@ static unsigned int get_lib_version(void)
 	version_checked = true;
 
 	char path[MAX_PATH];
-	nvvfx_get_sdk_path(path, sizeof(path));
+	if (!nvvfx_get_sdk_path(path, sizeof(path)))
+		return 0;
 
-	SetDllDirectoryA(path);
-
-	struct win_version_info nto_ver = {0};
-	if (get_dll_ver(L"NVVideoEffects.dll", &nto_ver))
-		version = nto_ver.major << 24 | nto_ver.minor << 16 | nto_ver.build << 8 | nto_ver.revis << 0;
-
-	SetDllDirectoryA(NULL);
+	pulsar_nv_read_version(path, PULSAR_NV_VFX_DLL, &version);
 	return version;
 }
 #endif
