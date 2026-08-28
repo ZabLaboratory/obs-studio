@@ -4,6 +4,9 @@
 #include <shlobj_core.h>
 #include <strsafe.h>
 #include <inttypes.h>
+#include <util/platform.h>
+#include <cstdlib>
+#include <cstring>
 
 using namespace DShow;
 
@@ -14,8 +17,50 @@ extern volatile long locks;
 
 /* ========================================================================= */
 
-VCamFilter::VCamFilter(bool program_return) : OutputFilter(),
-	queue_name(program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo")
+static bool directshow_legacy_alias_enabled(void)
+{
+	const char *value = getenv("PULSAR_DIRECTSHOW_LEGACY_ALIAS");
+	if (!value || !*value)
+		return true; /* stock OBS keeps its historical virtual-camera names */
+	return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 ||
+	       strcmp(value, "on") == 0;
+}
+
+static bool valid_runtime_instance_id(const char *value)
+{
+	if (!value || !*value || strlen(value) > 64)
+		return false;
+	if (!((*value >= 'A' && *value <= 'Z') || (*value >= 'a' && *value <= 'z') ||
+	      (*value >= '0' && *value <= '9')))
+		return false;
+	for (const char *p = value; *p; ++p) {
+		if (!( (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+		       (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+			return false;
+	}
+	return strcmp(value, ".") != 0 && strcmp(value, "..") != 0;
+}
+
+static std::wstring queue_name_for_filter(bool program_return)
+{
+	const wchar_t *legacy_name = program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
+	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
+	if (directshow_legacy_alias_enabled() || !valid_runtime_instance_id(runtime_id))
+		return legacy_name;
+
+	wchar_t wide_id[65] = {0};
+	/* IDs are validated as ASCII above; avoid a libobs link from this DLL. */
+	for (size_t i = 0; runtime_id[i] != '\0'; ++i)
+		wide_id[i] = (wchar_t)(unsigned char)runtime_id[i];
+
+	wchar_t name[256] = {0};
+	_snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE,
+			     L"Local\\Pulsar.%ls.%ls", wide_id,
+			     program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
+	return name;
+}
+
+VCamFilter::VCamFilter(bool program_return) : OutputFilter(), queue_name(queue_name_for_filter(program_return))
 {
 	thread_start = CreateEvent(nullptr, true, false, nullptr);
 	thread_stop = CreateEvent(nullptr, true, false, nullptr);
@@ -47,7 +92,7 @@ VCamFilter::VCamFilter(bool program_return) : OutputFilter(),
 	uint32_t new_obs_cy = obs_cy;
 	uint64_t new_obs_interval = obs_interval;
 
-	vq = video_queue_open_named(queue_name);
+	vq = video_queue_open_named(queue_name.c_str());
 	if (vq) {
 		if (video_queue_state(vq) == SHARED_QUEUE_STATE_READY) {
 			video_queue_get_info(vq, &new_obs_cx, &new_obs_cy, &new_obs_interval);
@@ -211,7 +256,7 @@ void VCamFilter::Frame(uint64_t ts)
 	   filter output! */
 
 	if (!vq) {
-			vq = video_queue_open_named(queue_name);
+			vq = video_queue_open_named(queue_name.c_str());
 	}
 
 	enum queue_state state = video_queue_state(vq);
