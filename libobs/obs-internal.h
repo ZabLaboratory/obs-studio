@@ -281,8 +281,26 @@ struct obs_view {
 	enum view_type type;
 };
 
+/*
+ * A pending pair swap is owned by obs->video until it is either consumed by
+ * the graphics thread or cancelled during video teardown.  The source refs
+ * held here become the corresponding view-channel refs when the swap commits.
+ */
+struct obs_view_atomic_swap {
+	struct obs_view *first_view;
+	uint32_t first_channel;
+	struct obs_source *first_source;
+	struct obs_view *second_view;
+	uint32_t second_channel;
+	struct obs_source *second_source;
+	obs_view_atomic_swap_cb callback;
+	void *callback_param;
+	uint64_t admission_floor_ns;
+};
+
 extern bool obs_view_init(struct obs_view *view, enum view_type type);
 extern void obs_view_free(struct obs_view *view);
+extern void obs_view_apply_pending_atomic_swap(uint64_t frame_id, uint64_t pts_ns);
 
 /* ------------------------------------------------------------------------- */
 /* displays */
@@ -433,6 +451,16 @@ struct obs_core_video {
 
 	pthread_mutex_t mixes_mutex;
 	DARRAY(struct obs_core_video_mix *) mixes;
+
+	/* Exactly one frame-boundary role swap may be pending at a time.  The
+	 * in-flight bit keeps teardown from destroying views while the graphics
+	 * thread is still applying the request or running its callback. */
+	pthread_mutex_t atomic_swap_mutex;
+	pthread_cond_t atomic_swap_cond;
+	bool atomic_swap_initialized;
+	struct obs_view_atomic_swap *pending_atomic_swap;
+	bool atomic_swap_inflight;
+	uint64_t video_frame_id;
 };
 
 extern void add_ready_encoder_group(obs_encoder_t *encoder);

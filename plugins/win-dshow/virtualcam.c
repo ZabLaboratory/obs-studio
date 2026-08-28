@@ -42,8 +42,14 @@ static bool valid_runtime_instance_id(const char *value)
 static void queue_name_for_output(obs_output_t *output, wchar_t *destination, size_t capacity)
 {
 	const char *output_name = obs_output_get_name(output);
-	const bool program_return = output_name && strcmp(output_name, "PulsarProgramReturn") == 0;
-	const wchar_t *legacy_name = program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
+	const char *output_id = obs_output_get_id(output);
+	const bool has_output_id = output_id && *output_id;
+	const bool program_return = has_output_id ? strcmp(output_id, "program_return_output") == 0
+							 : output_name && strcmp(output_name, "PulsarProgramReturn") == 0;
+	const bool preview_return = has_output_id ? strcmp(output_id, "preview_return_output") == 0
+							 : output_name && strcmp(output_name, "PulsarPreviewReturn") == 0;
+	const wchar_t *legacy_name = preview_return ? L"OBSPulsarPreviewReturnVideo"
+						   : program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
 	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
 
 	if (directshow_legacy_alias_enabled() || !valid_runtime_instance_id(runtime_id)) {
@@ -58,7 +64,8 @@ static void queue_name_for_output(obs_output_t *output, wchar_t *destination, si
 		wide_id[i] = (wchar_t)(unsigned char)runtime_id[i];
 
 	_snwprintf_s(destination, capacity, _TRUNCATE, L"Local\\Pulsar.%ls.%ls", wide_id,
-			     program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
+			     preview_return ? L"PreviewReturnVideo"
+					     : program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
 }
 
 static const char *virtualcam_name(void *unused)
@@ -183,6 +190,17 @@ struct obs_output_info virtualcam_info = {
 
 struct obs_output_info program_return_info = {
 	.id = "program_return_output",
+	.flags = OBS_OUTPUT_VIDEO,
+	.get_name = virtualcam_name,
+	.create = virtualcam_create,
+	.destroy = virtualcam_destroy,
+	.start = virtualcam_start,
+	.stop = virtualcam_stop,
+	.raw_video = virtual_video,
+};
+
+struct obs_output_info preview_return_info = {
+	.id = "preview_return_output",
 	.flags = OBS_OUTPUT_VIDEO,
 	.get_name = virtualcam_name,
 	.create = virtualcam_create,

@@ -65,7 +65,7 @@ protected:
 	const wchar_t *FilterName() const override;
 
 public:
-	VCamFilter(bool program_return);
+	VCamFilter(bool program_return, bool preview_return);
 	~VCamFilter() override;
 
 	STDMETHODIMP Pause() override;

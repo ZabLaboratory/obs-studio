@@ -967,6 +967,45 @@ EXPORT void obs_view_set_source(obs_view_t *view, uint32_t channel, obs_source_t
 /** Gets the source currently in use for this view context */
 EXPORT obs_source_t *obs_view_get_source(obs_view_t *view, uint32_t channel);
 
+/**
+ * Callback invoked on the graphics thread after a queued pair swap has been
+ * applied at a video frame boundary.
+ *
+ * `frame_id` identifies the frame whose render observes the new pair and
+ * `pts_ns` is the libobs video timestamp for that boundary.
+ */
+typedef void (*obs_view_atomic_swap_cb)(void *param, uint64_t frame_id, uint64_t pts_ns);
+
+/**
+ * Queue an atomic source swap with an immutable monotonic admission floor.
+ * Frames whose `pts_ns` is below the floor leave the request pending.
+ */
+EXPORT bool obs_view_queue_atomic_swap_with_floor(obs_view_t *first_view, uint32_t first_channel,
+                                       obs_source_t *first_source, obs_view_t *second_view,
+                                       uint32_t second_channel, obs_source_t *second_source,
+                                       uint64_t admission_floor_ns,
+                                       obs_view_atomic_swap_cb callback, void *param);
+
+/**
+ * Queue an atomic source swap for two independent view channels.
+ *
+ * The two channels are replaced together immediately before a graphics frame
+ * is rendered.  At most one swap may be pending; a successor may be queued
+ * after the graphics thread detaches the prior request, even while its
+ * completion callback is still unwinding.  The queued sources are referenced
+ * until the swap is applied or cancelled.
+ */
+EXPORT bool obs_view_queue_atomic_swap(obs_view_t *first_view, uint32_t first_channel,
+                                       obs_source_t *first_source, obs_view_t *second_view,
+                                       uint32_t second_channel, obs_source_t *second_source,
+                                       obs_view_atomic_swap_cb callback, void *param);
+
+/** Cancel the pending pair swap, if any, without changing either view. */
+EXPORT void obs_view_cancel_atomic_swap(void);
+
+/** Returns the non-owning main OBS view used by obs_get_video(). */
+EXPORT obs_view_t *obs_get_main_view(void);
+
 /** Renders the sources of this view context */
 EXPORT void obs_view_render(obs_view_t *view);
 

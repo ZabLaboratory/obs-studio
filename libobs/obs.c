@@ -698,6 +698,14 @@ static int obs_init_video(struct obs_video_info *ovi)
 		return OBS_VIDEO_FAIL;
 	if (pthread_mutex_init(&video->mixes_mutex, NULL) < 0)
 		return OBS_VIDEO_FAIL;
+	if (pthread_mutex_init(&video->atomic_swap_mutex, NULL) < 0)
+		return OBS_VIDEO_FAIL;
+	if (pthread_cond_init(&video->atomic_swap_cond, NULL) != 0) {
+		pthread_mutex_destroy(&video->atomic_swap_mutex);
+		pthread_mutex_init_value(&video->atomic_swap_mutex);
+		return OBS_VIDEO_FAIL;
+	}
+	video->atomic_swap_initialized = true;
 
 	/* Reset main canvas mix first so it remains first in the rendering order. */
 	if (!obs_canvas_reset_video_internal(obs->data.main_canvas, ovi))
@@ -820,6 +828,10 @@ void obs_free_video_mix(struct obs_core_video_mix *video)
 
 static void obs_free_video(void)
 {
+	/* The graphics thread has already joined in stop_video().  Drop any
+	 * sources retained by a not-yet-consumed Cut before views are destroyed. */
+	obs_view_cancel_atomic_swap();
+
 	pthread_mutex_lock(&obs->video.mixes_mutex);
 	size_t num_views = 0;
 	for (size_t i = 0; i < obs->video.mixes.num; i++) {
@@ -836,6 +848,13 @@ static void obs_free_video(void)
 
 	pthread_mutex_destroy(&obs->video.mixes_mutex);
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
+	if (obs->video.atomic_swap_initialized) {
+		pthread_cond_destroy(&obs->video.atomic_swap_cond);
+		memset(&obs->video.atomic_swap_cond, 0, sizeof(obs->video.atomic_swap_cond));
+		obs->video.atomic_swap_initialized = false;
+	}
+	pthread_mutex_destroy(&obs->video.atomic_swap_mutex);
+	pthread_mutex_init_value(&obs->video.atomic_swap_mutex);
 
 	for (size_t i = 0; i < obs->video.ready_encoder_groups.num; i++) {
 		obs_weak_encoder_release(obs->video.ready_encoder_groups.array[i]);
@@ -1227,6 +1246,7 @@ static bool obs_init(const char *locale, const char *module_config_path, profile
 	pthread_mutex_init_value(&obs->video.task_mutex);
 	pthread_mutex_init_value(&obs->video.encoder_group_mutex);
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
+	pthread_mutex_init_value(&obs->video.atomic_swap_mutex);
 
 	obs->name_store_owned = !store;
 	obs->name_store = store ? store : profiler_name_store_create();
@@ -1822,6 +1842,11 @@ audio_t *obs_get_audio(void)
 video_t *obs_get_video(void)
 {
 	return obs->data.main_canvas->mix->video;
+}
+
+obs_view_t *obs_get_main_view(void)
+{
+	return &obs->data.main_canvas->view;
 }
 
 obs_source_t *obs_get_output_source(uint32_t channel)

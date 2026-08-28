@@ -32,3 +32,18 @@ DEFINE_GUID(CLSID_PulsarProgramReturnVideo,
 			0xe4,
 			0x90);
 #endif
+
+#ifdef VIRTUALCAM_AVAILABLE
+DEFINE_GUID(CLSID_PulsarPreviewReturnVideo,
+			0x8c4e159d,
+			0x3f60,
+			0x4a42,
+			0x9a,
+			0x6d,
+			0x7f,
+			0x3a,
+			0x5b,
+			0x21,
+			0xe4,
+			0x91);
+#endif

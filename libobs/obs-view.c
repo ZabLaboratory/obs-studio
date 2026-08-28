@@ -115,6 +115,171 @@ void obs_view_set_source(obs_view_t *view, uint32_t channel, obs_source_t *sourc
 	}
 }
 
+static void release_atomic_swap(struct obs_view_atomic_swap *swap)
+{
+	if (!swap)
+		return;
+
+	if (swap->first_source)
+		obs_source_release(swap->first_source);
+	if (swap->second_source)
+		obs_source_release(swap->second_source);
+	bfree(swap);
+}
+
+static bool atomic_swap_is_graphics_thread(void)
+{
+	if (!obs->video.thread_initialized)
+		return false;
+
+	return pthread_equal(pthread_self(), obs->video.video_thread) != 0;
+}
+
+bool obs_view_queue_atomic_swap_with_floor(obs_view_t *first_view, uint32_t first_channel,
+					obs_source_t *first_source, obs_view_t *second_view,
+					uint32_t second_channel, obs_source_t *second_source,
+					uint64_t admission_floor_ns, obs_view_atomic_swap_cb callback, void *param)
+{
+	if (!obs || !obs->video.atomic_swap_initialized || !first_view || !second_view || first_view == second_view ||
+	    first_channel >= MAX_CHANNELS || second_channel >= MAX_CHANNELS)
+		return false;
+
+	struct obs_view_atomic_swap *swap = bzalloc(sizeof(*swap));
+	swap->first_view = first_view;
+	swap->first_channel = first_channel;
+	swap->second_view = second_view;
+	swap->second_channel = second_channel;
+	swap->first_source = obs_source_get_ref(first_source);
+	swap->second_source = obs_source_get_ref(second_source);
+	swap->callback = callback;
+	swap->callback_param = param;
+	swap->admission_floor_ns = admission_floor_ns;
+
+	/* A non-null input must have produced a retained reference. */
+	if ((first_source && !swap->first_source) || (second_source && !swap->second_source)) {
+		release_atomic_swap(swap);
+		return false;
+	}
+
+	pthread_mutex_lock(&obs->video.atomic_swap_mutex);
+	/* The pending pointer is the admission guard.  Once the graphics thread
+	 * has detached it, a successor may queue while the previous callback is
+	 * still unwinding; atomic_swap_inflight remains solely a teardown drain
+	 * barrier. */
+	if (obs->video.pending_atomic_swap) {
+		pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+		release_atomic_swap(swap);
+		return false;
+	}
+	obs->video.pending_atomic_swap = swap;
+	pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+	return true;
+}
+
+bool obs_view_queue_atomic_swap(obs_view_t *first_view, uint32_t first_channel,
+					obs_source_t *first_source, obs_view_t *second_view,
+					uint32_t second_channel, obs_source_t *second_source,
+					obs_view_atomic_swap_cb callback, void *param)
+{
+	return obs_view_queue_atomic_swap_with_floor(first_view, first_channel, first_source,
+									second_view, second_channel, second_source, 0, callback, param);
+}
+
+void obs_view_cancel_atomic_swap(void)
+{
+	if (!obs || !obs->video.atomic_swap_initialized)
+		return;
+
+	pthread_mutex_lock(&obs->video.atomic_swap_mutex);
+	struct obs_view_atomic_swap *swap = obs->video.pending_atomic_swap;
+	obs->video.pending_atomic_swap = NULL;
+	/* A caller may race the graphics thread after it has taken the pending
+	 * request.  Keep the mutex while waiting so teardown cannot proceed until
+	 * the callback has returned and no code can still dereference its views or
+	 * callback parameter.  The graphics thread itself must not wait here: a
+	 * callback is allowed to cancel its own request. */
+	if (obs->video.atomic_swap_inflight && !atomic_swap_is_graphics_thread()) {
+		while (obs->video.atomic_swap_inflight)
+			pthread_cond_wait(&obs->video.atomic_swap_cond, &obs->video.atomic_swap_mutex);
+	}
+	pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+
+	release_atomic_swap(swap);
+}
+
+void obs_view_apply_pending_atomic_swap(uint64_t frame_id, uint64_t pts_ns)
+{
+	if (!obs || !obs->video.atomic_swap_initialized)
+		return;
+
+	pthread_mutex_lock(&obs->video.atomic_swap_mutex);
+	struct obs_view_atomic_swap *swap = obs->video.pending_atomic_swap;
+	/* Keep the exact pending request until the graphics timestamp reaches the
+	 * immutable admission floor.  No refs, callback, or inflight state may be
+	 * touched by an earlier frame. */
+	if (swap && pts_ns < swap->admission_floor_ns) {
+		pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+		return;
+	}
+	obs->video.pending_atomic_swap = NULL;
+	if (swap)
+		obs->video.atomic_swap_inflight = true;
+	pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+
+	if (!swap)
+		return;
+
+	/* Lock both channel arrays in a stable order.  The graphics thread is the
+	 * only renderer, so once both locks are held no output can observe a
+	 * half-applied pair. */
+	const bool first_before_second = (uintptr_t)swap->first_view < (uintptr_t)swap->second_view;
+	if (first_before_second) {
+		pthread_mutex_lock(&swap->first_view->channels_mutex);
+		pthread_mutex_lock(&swap->second_view->channels_mutex);
+	} else {
+		pthread_mutex_lock(&swap->second_view->channels_mutex);
+		pthread_mutex_lock(&swap->first_view->channels_mutex);
+	}
+
+	struct obs_source *old_first = swap->first_view->channels[swap->first_channel];
+	struct obs_source *old_second = swap->second_view->channels[swap->second_channel];
+	struct obs_source *new_first = swap->first_source;
+	struct obs_source *new_second = swap->second_source;
+	/* The references acquired by queue_atomic_swap now belong to the views. */
+	swap->first_source = NULL;
+	swap->second_source = NULL;
+	swap->first_view->channels[swap->first_channel] = new_first;
+	swap->second_view->channels[swap->second_channel] = new_second;
+
+	pthread_mutex_unlock(&swap->first_view->channels_mutex);
+	pthread_mutex_unlock(&swap->second_view->channels_mutex);
+
+	if (new_first)
+		obs_source_activate(new_first, swap->first_view->type);
+	if (new_second)
+		obs_source_activate(new_second, swap->second_view->type);
+	if (old_first) {
+		obs_source_deactivate(old_first, swap->first_view->type);
+		obs_source_release(old_first);
+	}
+	if (old_second) {
+		obs_source_deactivate(old_second, swap->second_view->type);
+		obs_source_release(old_second);
+	}
+
+	if (swap->callback)
+		swap->callback(swap->callback_param, frame_id, pts_ns);
+
+	/* Publish completion only after the callback returns.  This is the drain
+	 * barrier used by teardown before it destroys either view. */
+	pthread_mutex_lock(&obs->video.atomic_swap_mutex);
+	obs->video.atomic_swap_inflight = false;
+	pthread_cond_broadcast(&obs->video.atomic_swap_cond);
+	pthread_mutex_unlock(&obs->video.atomic_swap_mutex);
+
+	release_atomic_swap(swap);
+}
+
 void obs_view_render(obs_view_t *view)
 {
 	if (!view)

@@ -1124,6 +1124,10 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 
 	source_profiler_render_begin();
 	profile_start(output_frame_name);
+	/* Apply the whole role swap before any mix renders this video tick.  The
+	 * callback runs on this graphics thread, after both view channel arrays are
+	 * replaced, so ProgramView and PreviewView cannot observe a mixed pair. */
+	obs_view_apply_pending_atomic_swap(++obs->video.video_frame_id, obs->video.video_time);
 	output_frames();
 	profile_end(output_frame_name);
 

@@ -41,9 +41,10 @@ static bool valid_runtime_instance_id(const char *value)
 	return strcmp(value, ".") != 0 && strcmp(value, "..") != 0;
 }
 
-static std::wstring queue_name_for_filter(bool program_return)
+static std::wstring queue_name_for_filter(bool program_return, bool preview_return)
 {
-	const wchar_t *legacy_name = program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
+	const wchar_t *legacy_name = preview_return ? L"OBSPulsarPreviewReturnVideo"
+						   : program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
 	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
 	if (directshow_legacy_alias_enabled() || !valid_runtime_instance_id(runtime_id))
 		return legacy_name;
@@ -56,11 +57,13 @@ static std::wstring queue_name_for_filter(bool program_return)
 	wchar_t name[256] = {0};
 	_snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE,
 			     L"Local\\Pulsar.%ls.%ls", wide_id,
-			     program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
+				     preview_return ? L"PreviewReturnVideo"
+						     : program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
 	return name;
 }
 
-VCamFilter::VCamFilter(bool program_return) : OutputFilter(), queue_name(queue_name_for_filter(program_return))
+VCamFilter::VCamFilter(bool program_return, bool preview_return)
+	: OutputFilter(), queue_name(queue_name_for_filter(program_return, preview_return))
 {
 	thread_start = CreateEvent(nullptr, true, false, nullptr);
 	thread_stop = CreateEvent(nullptr, true, false, nullptr);
