@@ -54,13 +54,22 @@ void add_default_module_paths(void)
 	bfree(module_data);
 }
 
-/* on windows, points to [base directory]/data/libobs */
+/* On Windows, resolve the libobs data root from the executable rather than
+ * the process cwd.  The headless Pulsar bootstrap deliberately gives each
+ * instance a private cwd for config/log/recording isolation, while the
+ * packaged data tree remains next to the executable. */
 char *find_libobs_data_file(const char *file)
 {
-	struct dstr path;
-	dstr_init(&path);
+	char *data_root = os_get_executable_path_ptr("../../data/libobs/");
+	if (!data_root)
+		return NULL;
 
-	if (check_path(file, "../../data/libobs/", &path))
+	struct dstr path;
+	dstr_init_copy(&path, data_root);
+	bfree(data_root);
+	dstr_cat(&path, file);
+
+	if (os_file_exists(path.array))
 		return path.array;
 
 	dstr_free(&path);
