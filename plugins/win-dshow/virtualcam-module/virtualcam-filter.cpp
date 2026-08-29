@@ -5,7 +5,10 @@
 #include <strsafe.h>
 #include <inttypes.h>
 #include <util/platform.h>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <sstream>
 
 using namespace DShow;
 
@@ -13,6 +16,8 @@ extern bool initialize_placeholder();
 extern const uint8_t *get_placeholder_ptr();
 extern const bool get_placeholder_size(int *out_cx, int *out_cy);
 extern volatile long locks;
+
+static uint64_t trace_monotonic_ns();
 
 /* ========================================================================= */
 
@@ -46,6 +51,7 @@ static std::wstring queue_name_for_filter(enum directshow_queue_namespace queue_
 VCamFilter::VCamFilter(enum directshow_consumer_filter_kind filter_kind)
 	: OutputFilter()
 {
+	program_return = filter_kind == DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN;
 	const enum directshow_queue_namespace queue_namespace = directshow_queue_namespace_for_consumer(filter_kind);
 	queue_namespace_rejected = queue_namespace == DIRECTSHOW_QUEUE_NAMESPACE_REJECT;
 	queue_name = queue_name_for_filter(queue_namespace, filter_kind);
@@ -237,6 +243,7 @@ void VCamFilter::Thread()
 
 void VCamFilter::Frame(uint64_t ts)
 {
+	const uint64_t frame_entry_monotonic_ns = trace_monotonic_ns();
 	if (queue_namespace_rejected) {
 		uint8_t *ptr;
 		if (LockSampleData(&ptr)) {
@@ -337,23 +344,173 @@ void VCamFilter::Frame(uint64_t ts)
 
 	/* Actual output */
 	uint8_t *ptr;
+	struct video_queue_frame_metadata metadata = {};
+	struct directshow_stage_timing timing = {};
+	timing.frame_entry_monotonic_ns = frame_entry_monotonic_ns;
+	bool consumed_program_frame = false;
 	if (LockSampleData(&ptr)) {
+		timing.lock_sample_data_acquired_monotonic_ns = trace_monotonic_ns();
 		if (state == SHARED_QUEUE_STATE_READY)
-			ShowOBSFrame(ptr);
+			timing.queue_read_start_monotonic_ns = trace_monotonic_ns();
+		if (state == SHARED_QUEUE_STATE_READY)
+			consumed_program_frame = ShowOBSFrame(ptr, &metadata);
+		if (state == SHARED_QUEUE_STATE_READY)
+			timing.queue_read_completed_monotonic_ns = trace_monotonic_ns();
 		else
 			ShowDefaultFrame(ptr);
 
 		UnlockSampleData(ts, ts + obs_interval);
+		timing.unlock_sample_data_completed_monotonic_ns = trace_monotonic_ns();
 	}
+
+	if (consumed_program_frame && program_return)
+		EmitDirectShowObservation(metadata, timing);
 }
 
-void VCamFilter::ShowOBSFrame(uint8_t *ptr)
+bool VCamFilter::ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata)
 {
-	uint64_t temp;
-	if (!video_queue_read(vq, &scaler, ptr, &temp)) {
+	uint64_t temp = 0;
+	if (!video_queue_read_ex(vq, &scaler, ptr, &temp, metadata)) {
 		video_queue_close(vq);
 		vq = nullptr;
+		return false;
 	}
+	return true;
+}
+
+static uint64_t trace_monotonic_ns()
+{
+	static LARGE_INTEGER frequency = [] {
+		LARGE_INTEGER value = {};
+		QueryPerformanceFrequency(&value);
+		return value;
+	}();
+	LARGE_INTEGER counter = {};
+	QueryPerformanceCounter(&counter);
+	if (frequency.QuadPart <= 0)
+		return 0;
+	const uint64_t ticks = (uint64_t)counter.QuadPart;
+	const uint64_t hz = (uint64_t)frequency.QuadPart;
+	return (ticks / hz) * 1000000000ULL + ((ticks % hz) * 1000000000ULL) / hz;
+}
+
+static bool trace_prepare_identifier(const char *value, size_t capacity, std::string &raw,
+				     std::string &escaped)
+{
+	raw.clear();
+	escaped.clear();
+	if (!value || !capacity)
+		return false;
+
+	const void *terminator = std::memchr(value, '\0', capacity);
+	if (!terminator)
+		return false;
+
+	const size_t length = static_cast<const char *>(terminator) - value;
+	raw.assign(value, length);
+	escaped.reserve(length);
+	for (const unsigned char ch : raw) {
+		switch (ch) {
+		case '\\': escaped += "\\\\"; break;
+		case '"': escaped += "\\\""; break;
+		case '\b': escaped += "\\b"; break;
+		case '\f': escaped += "\\f"; break;
+		case '\n': escaped += "\\n"; break;
+		case '\r': escaped += "\\r"; break;
+		case '\t': escaped += "\\t"; break;
+		default:
+			if (ch < 0x20)
+				return false;
+			escaped.push_back((char)ch);
+			break;
+		}
+	}
+	return true;
+}
+
+static void append_trace_line(const std::string &line, const std::string &runtime_id)
+{
+	const char *path = getenv("PULSAR_TRACE_PATH");
+	if (!path || !*path || runtime_id.empty())
+		return;
+
+	const std::string mutex_name = std::string("Local\\Pulsar.") + runtime_id + ".Trace";
+	HANDLE mutex = CreateMutexA(nullptr, FALSE, mutex_name.c_str());
+	if (!mutex)
+		return;
+	WaitForSingleObject(mutex, INFINITE);
+
+	HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file != INVALID_HANDLE_VALUE) {
+		const std::string payload = line + "\n";
+		DWORD written = 0;
+		WriteFile(file, payload.data(), (DWORD)payload.size(), &written, nullptr);
+		CloseHandle(file);
+	}
+
+	ReleaseMutex(mutex);
+	CloseHandle(mutex);
+}
+
+void VCamFilter::EmitDirectShowObservation(const struct video_queue_frame_metadata &metadata,
+						   const struct directshow_stage_timing &timing)
+{
+	std::string runtime_id;
+	std::string runtime_id_json;
+	std::string command_id;
+	std::string command_id_json;
+	std::string intent_id;
+	std::string intent_id_json;
+	std::string take_command_id;
+	std::string take_command_id_json;
+	if (!metadata.valid ||
+	    !trace_prepare_identifier(metadata.runtime_instance_id, sizeof(metadata.runtime_instance_id), runtime_id,
+				      runtime_id_json) ||
+	    !trace_prepare_identifier(metadata.command_id, sizeof(metadata.command_id), command_id, command_id_json) ||
+	    !trace_prepare_identifier(metadata.intent_id, sizeof(metadata.intent_id), intent_id, intent_id_json) ||
+	    !trace_prepare_identifier(metadata.take_command_id, sizeof(metadata.take_command_id), take_command_id,
+				      take_command_id_json) ||
+	    take_command_id.empty() || last_trace_take == take_command_id)
+		return;
+
+	const uint64_t emission_monotonic_ns = trace_monotonic_ns();
+	const bool timing_complete = timing.frame_entry_monotonic_ns > 0 &&
+		timing.lock_sample_data_acquired_monotonic_ns > timing.frame_entry_monotonic_ns &&
+		timing.queue_read_start_monotonic_ns > timing.lock_sample_data_acquired_monotonic_ns &&
+		timing.queue_read_completed_monotonic_ns > timing.queue_read_start_monotonic_ns &&
+		timing.unlock_sample_data_completed_monotonic_ns > timing.queue_read_completed_monotonic_ns &&
+		emission_monotonic_ns > timing.unlock_sample_data_completed_monotonic_ns;
+	const uint64_t observed_at_monotonic_ns = timing.unlock_sample_data_completed_monotonic_ns;
+
+	std::ostringstream observation;
+	observation << "{\"record_type\":\"observation\",\"boundary\":\"directshow_return\","
+			<< "\"clock_domain\":\"monotonic_ns\",\"runtime_instance_id\":\""
+			<< runtime_id_json << "\",\"command_id\":\""
+			<< command_id_json << "\",\"intent_id\":\""
+			<< intent_id_json << "\",\"take_command_id\":\""
+			<< take_command_id_json << "\",\"revisions\":{"
+			<< "\"program\":" << metadata.program_revision << ",\"preview\":"
+			<< metadata.preview_revision << ",\"role_map\":" << metadata.role_map_revision << "},"
+			<< "\"frame_id\":" << metadata.frame_id << ",\"pts_ns\":" << metadata.pts_ns
+			<< ",\"observed_at_monotonic_ns\":" << observed_at_monotonic_ns
+			<< ",\"valid\":true,\"program_frame\":true,\"surface\":\"ProgramReturn\","
+			<< "\"consumer\":\"DirectShow\"}";
+	if (timing_complete) {
+		observation.seekp(-1, std::ios_base::end);
+		observation << ",\"frame_entry_monotonic_ns\":" << timing.frame_entry_monotonic_ns
+				<< ",\"lock_sample_data_acquired_monotonic_ns\":"
+				<< timing.lock_sample_data_acquired_monotonic_ns
+				<< ",\"queue_read_start_monotonic_ns\":"
+				<< timing.queue_read_start_monotonic_ns
+				<< ",\"queue_read_completed_monotonic_ns\":"
+				<< timing.queue_read_completed_monotonic_ns
+				<< ",\"unlock_sample_data_completed_monotonic_ns\":"
+				<< timing.unlock_sample_data_completed_monotonic_ns
+				<< ",\"emission_monotonic_ns\":" << emission_monotonic_ns << "}";
+	}
+	append_trace_line(observation.str(), runtime_id);
+	last_trace_take = take_command_id;
 }
 
 void VCamFilter::ShowDefaultFrame(uint8_t *ptr)

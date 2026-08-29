@@ -3,19 +3,84 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <wchar.h>
 #include "util/threading.h"
-#include "shared-memory-queue.h"
+#include "../../shared/obs-shared-memory-queue/shared-memory-queue.h"
 #include "directshow-namespace.h"
+#include "../../../plugins/pulsar-frontend-stub/include/pulsar-runtime-telemetry-abi.h"
 
 struct virtualcam_data {
 	obs_output_t *output;
 	video_queue_t *vq;
 	wchar_t queue_name[256];
 	bool queue_namespace_rejected;
+	bool program_return;
 	volatile bool active;
 	volatile bool stopping;
 };
+
+static void copy_telemetry_identifier(char *destination, const char *value)
+{
+	if (!value)
+		value = "";
+	strncpy(destination, value, PULSAR_RUNTIME_TELEMETRY_IDENTIFIER_CAPACITY - 1);
+	destination[PULSAR_RUNTIME_TELEMETRY_IDENTIFIER_CAPACITY - 1] = '\0';
+}
+
+static bool copy_telemetry_counter(uint64_t *destination, long long value)
+{
+	if (!destination || value < 0 || value > INT64_MAX)
+		return false;
+	*destination = (uint64_t)value;
+	return true;
+}
+
+static void snapshot_runtime_frame(struct video_queue_frame_metadata *metadata)
+{
+	memset(metadata, 0, sizeof(*metadata));
+	proc_handler_t *ph = obs_get_proc_handler();
+	if (!ph)
+		return;
+
+	calldata_t cd = {0};
+	if (!proc_handler_call(ph, PULSAR_RUNTIME_TELEMETRY_SNAPSHOT_PROC, &cd)) {
+		calldata_free(&cd);
+		return;
+	}
+
+	const bool valid = calldata_bool(&cd, "valid");
+	uint64_t server_seq = 0;
+	uint64_t frame_id = 0;
+	uint64_t pts_ns = 0;
+	uint64_t program_revision = 0;
+	uint64_t preview_revision = 0;
+	uint64_t role_map_revision = 0;
+	const bool counters_valid =
+		copy_telemetry_counter(&server_seq, calldata_int(&cd, "server_seq")) &&
+		copy_telemetry_counter(&frame_id, calldata_int(&cd, "frame_id")) &&
+		copy_telemetry_counter(&pts_ns, calldata_int(&cd, "pts_ns")) &&
+		copy_telemetry_counter(&program_revision, calldata_int(&cd, "program_revision")) &&
+		copy_telemetry_counter(&preview_revision, calldata_int(&cd, "preview_revision")) &&
+		copy_telemetry_counter(&role_map_revision, calldata_int(&cd, "role_map_revision"));
+	if (!valid || !counters_valid) {
+		calldata_free(&cd);
+		return;
+	}
+
+	metadata->server_seq = server_seq;
+	metadata->frame_id = frame_id;
+	metadata->pts_ns = pts_ns;
+	metadata->program_revision = program_revision;
+	metadata->preview_revision = preview_revision;
+	metadata->role_map_revision = role_map_revision;
+	metadata->valid = 1U;
+	copy_telemetry_identifier(metadata->runtime_instance_id, calldata_string(&cd, "runtime_instance_id"));
+	copy_telemetry_identifier(metadata->command_id, calldata_string(&cd, "command_id"));
+	copy_telemetry_identifier(metadata->intent_id, calldata_string(&cd, "intent_id"));
+	copy_telemetry_identifier(metadata->take_command_id, calldata_string(&cd, "take_command_id"));
+	calldata_free(&cd);
+}
 
 static bool queue_name_for_output(obs_output_t *output, wchar_t *destination, size_t capacity)
 {
@@ -67,6 +132,8 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 {
 	struct virtualcam_data *vcam = (struct virtualcam_data *)bzalloc(sizeof(*vcam));
 	vcam->output = output;
+	vcam->program_return = obs_output_get_id(output) &&
+				       strcmp(obs_output_get_id(output), "program_return_output") == 0;
 	vcam->queue_namespace_rejected = !queue_name_for_output(
 		output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
 	if (vcam->queue_namespace_rejected)
@@ -157,7 +224,9 @@ static void virtual_video(void *param, struct video_data *frame)
 		return;
 	}
 
-	video_queue_write(vcam->vq, frame->data, frame->linesize, frame->timestamp);
+	struct video_queue_frame_metadata metadata;
+	snapshot_runtime_frame(&metadata);
+	video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp, &metadata);
 }
 
 struct obs_output_info virtualcam_info = {

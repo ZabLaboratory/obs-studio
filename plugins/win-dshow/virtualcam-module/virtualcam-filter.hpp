@@ -30,12 +30,22 @@ typedef struct {
 	uint8_t *scaled_data;
 } placeholder_t;
 
+struct directshow_stage_timing {
+	uint64_t frame_entry_monotonic_ns = 0;
+	uint64_t lock_sample_data_acquired_monotonic_ns = 0;
+	uint64_t queue_read_start_monotonic_ns = 0;
+	uint64_t queue_read_completed_monotonic_ns = 0;
+	uint64_t unlock_sample_data_completed_monotonic_ns = 0;
+	uint64_t emission_monotonic_ns = 0;
+};
+
 class VCamFilter : public DShow::OutputFilter {
 	std::thread th;
 
 	video_queue_t *vq = nullptr;
 	std::wstring queue_name;
 	bool queue_namespace_rejected = false;
+	bool program_return = false;
 	int queue_mode = 0;
 	bool in_obs = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
@@ -51,6 +61,7 @@ class VCamFilter : public DShow::OutputFilter {
 	volatile bool active = false;
 
 	nv12_scale_t scaler = {};
+	std::string last_trace_take;
 
 	inline bool stopped() const { return WaitForSingleObject(thread_stop, 0) != WAIT_TIMEOUT; }
 
@@ -58,8 +69,10 @@ class VCamFilter : public DShow::OutputFilter {
 
 	void Thread();
 	void Frame(uint64_t ts);
-	void ShowOBSFrame(uint8_t *ptr);
+	bool ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata);
 	void ShowDefaultFrame(uint8_t *ptr);
+	void EmitDirectShowObservation(const struct video_queue_frame_metadata &metadata,
+					      const struct directshow_stage_timing &timing);
 	void UpdatePlaceholder(void);
 	const int GetOutputBufferSize(void);
 
