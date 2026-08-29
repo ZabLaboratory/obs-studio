@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include "../directshow-namespace.h"
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -34,6 +35,7 @@ class VCamFilter : public DShow::OutputFilter {
 
 	video_queue_t *vq = nullptr;
 	std::wstring queue_name;
+	bool queue_namespace_rejected = false;
 	int queue_mode = 0;
 	bool in_obs = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
@@ -65,7 +67,7 @@ protected:
 	const wchar_t *FilterName() const override;
 
 public:
-	VCamFilter(bool program_return, bool preview_return);
+	VCamFilter(enum directshow_consumer_filter_kind filter_kind);
 	~VCamFilter() override;
 
 	STDMETHODIMP Pause() override;

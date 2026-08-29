@@ -76,9 +76,12 @@ STDMETHODIMP VCamFactory::CreateInstance(LPUNKNOWN parent, REFIID, void **p_ptr)
 
 	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) || IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo) ||
 	    IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo)) {
-		const bool program_return = IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo);
-		const bool preview_return = IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo);
-		*p_ptr = (void *)new VCamFilter(program_return, preview_return);
+		enum directshow_consumer_filter_kind filter_kind = DIRECTSHOW_CONSUMER_FILTER_STOCK;
+		if (IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo))
+			filter_kind = DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN;
+		else if (IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo))
+			filter_kind = DIRECTSHOW_CONSUMER_FILTER_PREVIEW_RETURN;
+		*p_ptr = (void *)new VCamFilter(filter_kind);
 		return S_OK;
 	}
 

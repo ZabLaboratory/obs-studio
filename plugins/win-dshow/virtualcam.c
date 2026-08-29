@@ -6,40 +6,18 @@
 #include <wchar.h>
 #include "util/threading.h"
 #include "shared-memory-queue.h"
+#include "directshow-namespace.h"
 
 struct virtualcam_data {
 	obs_output_t *output;
 	video_queue_t *vq;
 	wchar_t queue_name[256];
+	bool queue_namespace_rejected;
 	volatile bool active;
 	volatile bool stopping;
 };
 
-static bool directshow_legacy_alias_enabled(void)
-{
-	const char *value = getenv("PULSAR_DIRECTSHOW_LEGACY_ALIAS");
-	if (!value || !*value)
-		return true; /* stock OBS keeps its historical virtual-camera names */
-	return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 ||
-	       strcmp(value, "on") == 0;
-}
-
-static bool valid_runtime_instance_id(const char *value)
-{
-	if (!value || !*value || strlen(value) > 64)
-		return false;
-	if (!((*value >= 'A' && *value <= 'Z') || (*value >= 'a' && *value <= 'z') ||
-	      (*value >= '0' && *value <= '9')))
-		return false;
-	for (const char *p = value; *p; ++p) {
-		if (!( (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
-		       (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
-			return false;
-	}
-	return strcmp(value, ".") != 0 && strcmp(value, "..") != 0;
-}
-
-static void queue_name_for_output(obs_output_t *output, wchar_t *destination, size_t capacity)
+static bool queue_name_for_output(obs_output_t *output, wchar_t *destination, size_t capacity)
 {
 	const char *output_name = obs_output_get_name(output);
 	const char *output_id = obs_output_get_id(output);
@@ -50,13 +28,16 @@ static void queue_name_for_output(obs_output_t *output, wchar_t *destination, si
 							 : output_name && strcmp(output_name, "PulsarPreviewReturn") == 0;
 	const wchar_t *legacy_name = preview_return ? L"OBSPulsarPreviewReturnVideo"
 						   : program_return ? L"OBSPulsarProgramReturnVideo" : L"OBSVirtualCamVideo";
-	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
+	const enum directshow_queue_namespace queue_namespace = directshow_queue_namespace_from_environment();
 
-	if (directshow_legacy_alias_enabled() || !valid_runtime_instance_id(runtime_id)) {
+	if (queue_namespace == DIRECTSHOW_QUEUE_NAMESPACE_REJECT)
+		return false;
+	if (queue_namespace == DIRECTSHOW_QUEUE_NAMESPACE_LEGACY) {
 		wcsncpy(destination, legacy_name, capacity - 1);
 		destination[capacity - 1] = 0;
-		return;
+		return true;
 	}
+	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
 
 	wchar_t wide_id[65] = {0};
 	/* IDs are validated as ASCII above; avoid a libobs link from this DLL. */
@@ -66,6 +47,7 @@ static void queue_name_for_output(obs_output_t *output, wchar_t *destination, si
 	_snwprintf_s(destination, capacity, _TRUNCATE, L"Local\\Pulsar.%ls.%ls", wide_id,
 			     preview_return ? L"PreviewReturnVideo"
 					     : program_return ? L"ProgramReturnVideo" : L"VirtualCamVideo");
+	return true;
 }
 
 static const char *virtualcam_name(void *unused)
@@ -85,7 +67,10 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 {
 	struct virtualcam_data *vcam = (struct virtualcam_data *)bzalloc(sizeof(*vcam));
 	vcam->output = output;
-	queue_name_for_output(output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
+	vcam->queue_namespace_rejected = !queue_name_for_output(
+		output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
+	if (vcam->queue_namespace_rejected)
+		blog(LOG_ERROR, "[pulsar-directshow] queue namespace rejected; producer is disabled");
 
 	UNUSED_PARAMETER(settings);
 	return vcam;
@@ -94,6 +79,8 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 static bool virtualcam_start(void *data)
 {
 	struct virtualcam_data *vcam = (struct virtualcam_data *)data;
+	if (vcam->queue_namespace_rejected)
+		return false;
 	uint32_t width = obs_output_get_width(vcam->output);
 	uint32_t height = obs_output_get_height(vcam->output);
 
@@ -127,12 +114,8 @@ static bool virtualcam_start(void *data)
 
 	os_atomic_set_bool(&vcam->active, true);
 	os_atomic_set_bool(&vcam->stopping, false);
-	{
-		const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
-		blog(LOG_INFO, "Virtual output started (queue=%ls runtime_instance_id=%s legacy_alias=%s)",
-		     vcam->queue_name, runtime_id ? runtime_id : "",
-		     directshow_legacy_alias_enabled() ? "1" : "0");
-	}
+	blog(LOG_INFO, "Virtual output started (queue=%ls namespace=%s)", vcam->queue_name,
+	     directshow_queue_namespace_name(directshow_queue_namespace_from_environment()));
 	obs_output_begin_data_capture(vcam->output, 0);
 	return true;
 }
