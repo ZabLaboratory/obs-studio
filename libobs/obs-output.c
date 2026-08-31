@@ -2219,6 +2219,22 @@ static inline size_t count_streamable_frames(struct obs_output *output)
 	return eligible;
 }
 
+void obs_output_set_low_latency_interleave(obs_output_t *output, bool enabled)
+{
+	if (!obs_output_valid(output, "obs_output_set_low_latency_interleave"))
+		return;
+
+	os_atomic_set_bool(&output->low_latency_interleave, enabled);
+}
+
+bool obs_output_get_low_latency_interleave(const obs_output_t *output)
+{
+	if (!obs_output_valid(output, "obs_output_get_low_latency_interleave"))
+		return false;
+
+	return os_atomic_load_bool(&output->low_latency_interleave);
+}
+
 static void interleave_packets(void *data, struct encoder_packet *packet, struct encoder_packet_time *packet_time)
 {
 	struct obs_output *output = data;
@@ -2292,7 +2308,13 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 			set_higher_ts(output, &out);
 
 			size_t streamable = count_streamable_frames(output);
-			if (streamable) {
+			if (os_atomic_load_bool(&output->low_latency_interleave)) {
+				/* Every packet counted here already has an opposing packet
+				 * with a higher DTS, so draining the eligible prefix keeps
+				 * timestamps monotonic without retaining a standing queue. */
+				while (streamable--)
+					send_interleaved(output);
+			} else if (streamable) {
 				send_interleaved(output);
 
 				/* If we have more eligible packets queued than we normally should have,

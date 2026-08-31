@@ -1974,6 +1974,19 @@ EXPORT void obs_output_stop(obs_output_t *output);
  */
 EXPORT void obs_output_set_delay(obs_output_t *output, uint32_t delay_sec, uint32_t flags);
 
+/**
+ * Enables low-latency packet interleaving for an encoded output.
+ *
+ * The default interleaver deliberately retains a bounded backlog. Low-latency
+ * mode drains every packet whose opposing stream has already advanced beyond
+ * its DTS, preserving monotonic ordering while avoiding that standing queue.
+ * This does not bypass audio, reorder packets, or change encoder settings.
+ */
+EXPORT void obs_output_set_low_latency_interleave(obs_output_t *output, bool enabled);
+
+/** Returns whether low-latency packet interleaving is enabled. */
+EXPORT bool obs_output_get_low_latency_interleave(const obs_output_t *output);
+
 /** Gets the currently set delay value, in seconds. */
 EXPORT uint32_t obs_output_get_delay(const obs_output_t *output);
 
