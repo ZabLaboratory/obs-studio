@@ -2204,9 +2204,27 @@ static void apply_ept_offsets(struct obs_output *output)
 static inline size_t count_streamable_frames(struct obs_output *output)
 {
 	size_t eligible = 0;
+	const bool low_latency = os_atomic_load_bool(&output->low_latency_interleave);
 
 	for (size_t idx = 0; idx < output->interleaved_packets.num; idx++) {
 		struct encoder_packet *pkt = &output->interleaved_packets.array[idx];
+
+		/* A low-latency live output may release video as soon as every
+		 * other video track has advanced. Audio remains timestamped and
+		 * interleaved, but its capture/encoder delay no longer blocks a
+		 * Program cut whose audio route did not change. */
+		if (low_latency && pkt->type == OBS_ENCODER_VIDEO) {
+			bool higher_video = true;
+			for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
+				if (!output->video_encoders[i] || i == pkt->track_idx)
+					continue;
+				higher_video = higher_video && output->highest_video_ts[i] > pkt->dts_usec;
+			}
+			if (!higher_video)
+				break;
+			eligible++;
+			continue;
+		}
 
 		/* Only count an interleaved packet as streamable if there are packets of the opposing type and of a
 		 * higher timestamp in the interleave buffer. This ensures that the timestamps are monotonic. */
