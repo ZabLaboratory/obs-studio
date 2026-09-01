@@ -314,10 +314,15 @@ video_t *obs_view_add(obs_view_t *view)
 
 video_t *obs_view_add2(obs_view_t *view, struct obs_video_info *ovi)
 {
-	if (!view || !ovi)
+	return obs_view_add3(view, ovi, 6);
+}
+
+video_t *obs_view_add3(obs_view_t *view, struct obs_video_info *ovi, size_t cache_size)
+{
+	if (!view || !ovi || cache_size == 0)
 		return NULL;
 
-	struct obs_core_video_mix *mix = obs_create_video_mix(ovi);
+	struct obs_core_video_mix *mix = obs_create_video_mix_with_cache(ovi, cache_size);
 	if (!mix) {
 		return NULL;
 	}

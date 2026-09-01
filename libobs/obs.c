@@ -30,7 +30,7 @@ static THREAD_LOCAL bool is_ui_thread = false;
 extern void add_default_module_paths(void);
 extern char *find_libobs_data_file(const char *file);
 
-static inline void make_video_info(struct video_output_info *vi, struct obs_video_info *ovi)
+static inline void make_video_info(struct video_output_info *vi, struct obs_video_info *ovi, size_t cache_size)
 {
 	vi->name = "video";
 	vi->format = ovi->output_format;
@@ -40,7 +40,7 @@ static inline void make_video_info(struct video_output_info *vi, struct obs_vide
 	vi->height = ovi->output_height;
 	vi->range = ovi->range;
 	vi->colorspace = ovi->colorspace;
-	vi->cache_size = 6;
+	vi->cache_size = cache_size;
 }
 
 static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
@@ -602,13 +602,13 @@ static inline void set_video_matrix(struct obs_core_video_mix *video, struct vid
 	memcpy(video->color_matrix, &mat, sizeof(float) * 16);
 }
 
-static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_mix *video)
+static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_mix *video, size_t cache_size)
 {
 	struct video_output_info vi;
 
 	pthread_mutex_init_value(&video->gpu_encoder_mutex);
 
-	make_video_info(&vi, ovi);
+	make_video_info(&vi, ovi, cache_size);
 	video->ovi = *ovi;
 
 	/* main view graphics thread drives all frame output,
@@ -657,8 +657,13 @@ static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_
 
 struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi)
 {
+	return obs_create_video_mix_with_cache(ovi, 6);
+}
+
+struct obs_core_video_mix *obs_create_video_mix_with_cache(struct obs_video_info *ovi, size_t cache_size)
+{
 	struct obs_core_video_mix *video = bzalloc(sizeof(struct obs_core_video_mix));
-	if (obs_init_video_mix(ovi, video) != OBS_VIDEO_SUCCESS) {
+	if (obs_init_video_mix(ovi, video, cache_size) != OBS_VIDEO_SUCCESS) {
 		bfree(video);
 		video = NULL;
 	}

@@ -1015,6 +1015,9 @@ EXPORT video_t *obs_view_add(obs_view_t *view);
 /** Adds a view to the main render loop, with custom video settings */
 EXPORT video_t *obs_view_add2(obs_view_t *view, struct obs_video_info *ovi);
 
+/** Adds a view with custom video settings and frame cache depth. */
+EXPORT video_t *obs_view_add3(obs_view_t *view, struct obs_video_info *ovi, size_t cache_size);
+
 /** Removes a view from the main render loop */
 EXPORT void obs_view_remove(obs_view_t *view);
 

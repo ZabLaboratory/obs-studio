@@ -402,6 +402,7 @@ struct obs_core_video_mix {
 };
 
 extern struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi);
+extern struct obs_core_video_mix *obs_create_video_mix_with_cache(struct obs_video_info *ovi, size_t cache_size);
 extern void obs_free_video_mix(struct obs_core_video_mix *video);
 
 struct obs_core_video {
