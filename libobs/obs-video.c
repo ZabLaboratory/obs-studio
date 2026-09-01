@@ -827,9 +827,18 @@ static inline void output_borrowed_video_data(struct obs_core_video_mix *video, 
 	if (!video->borrowed_video_initialized)
 		return;
 
+	struct video_data borrowed_frame = *input_frame;
+	const struct video_output_info *info = video_output_get_info(video->video);
+	if (info && borrowed_frame.data[0] && !borrowed_frame.data[1] &&
+	    (info->format == VIDEO_FORMAT_NV12 || info->format == VIDEO_FORMAT_P010)) {
+		borrowed_frame.data[1] = borrowed_frame.data[0] +
+					 (size_t)borrowed_frame.linesize[0] * info->height;
+		borrowed_frame.linesize[1] = borrowed_frame.linesize[0];
+	}
+
 	pthread_mutex_lock(&video->borrowed_video_mutex);
 	if (video->borrowed_video_callbacks.num) {
-		video->borrowed_video_frame = *input_frame;
+		video->borrowed_video_frame = borrowed_frame;
 		video->borrowed_video_pending = true;
 		pthread_cond_broadcast(&video->borrowed_video_cond);
 	}

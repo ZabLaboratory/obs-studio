@@ -249,6 +249,7 @@ struct obs_output_info program_return_info = {
 	.start = virtualcam_start,
 	.stop = virtualcam_stop,
 	.raw_video = virtual_video,
+	.raw_video_borrowed = virtual_video,
 };
 
 struct obs_output_info preview_return_info = {
