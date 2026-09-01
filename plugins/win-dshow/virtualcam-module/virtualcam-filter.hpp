@@ -37,6 +37,7 @@ struct directshow_stage_timing {
 	uint64_t queue_read_completed_monotonic_ns = 0;
 	uint64_t unlock_sample_data_completed_monotonic_ns = 0;
 	uint64_t emission_monotonic_ns = 0;
+	struct video_queue_read_counters queue_counters = {};
 };
 
 class VCamFilter : public DShow::OutputFilter {
@@ -73,7 +74,8 @@ class VCamFilter : public DShow::OutputFilter {
 
 	void Thread();
 	void Frame(uint64_t ts);
-	bool ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata);
+	bool ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata,
+			  struct video_queue_read_counters *counters);
 	void ShowDefaultFrame(uint8_t *ptr);
 	void EmitDirectShowObservation(const struct video_queue_frame_metadata &metadata,
 					      const struct directshow_stage_timing &timing);

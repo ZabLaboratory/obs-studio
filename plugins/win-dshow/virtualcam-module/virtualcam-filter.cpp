@@ -384,10 +384,10 @@ void VCamFilter::Frame(uint64_t ts)
 		if (state == SHARED_QUEUE_STATE_READY)
 			timing.queue_read_start_monotonic_ns = trace_monotonic_ns();
 		if (state == SHARED_QUEUE_STATE_READY)
-			consumed_program_frame = ShowOBSFrame(ptr, &metadata);
+			consumed_program_frame = ShowOBSFrame(ptr, &metadata, &timing.queue_counters);
 		if (state == SHARED_QUEUE_STATE_READY)
 			timing.queue_read_completed_monotonic_ns = trace_monotonic_ns();
-		else
+		if (state != SHARED_QUEUE_STATE_READY || !consumed_program_frame)
 			ShowDefaultFrame(ptr);
 
 		UnlockSampleData(ts, ts + obs_interval);
@@ -398,15 +398,13 @@ void VCamFilter::Frame(uint64_t ts)
 		EmitDirectShowObservation(metadata, timing);
 }
 
-bool VCamFilter::ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata)
+bool VCamFilter::ShowOBSFrame(uint8_t *ptr, struct video_queue_frame_metadata *metadata,
+				      struct video_queue_read_counters *counters)
 {
 	uint64_t temp = 0;
-	if (!video_queue_read_ex(vq, &scaler, ptr, &temp, metadata)) {
-		video_queue_close(vq);
-		vq = nullptr;
-		return false;
-	}
-	return true;
+	const bool consumed = video_queue_read_ex(vq, &scaler, ptr, &temp, metadata);
+	video_queue_get_read_counters(vq, counters);
+	return consumed;
 }
 
 static uint64_t trace_monotonic_ns()
@@ -526,7 +524,11 @@ void VCamFilter::EmitDirectShowObservation(const struct video_queue_frame_metada
 			<< "\"frame_id\":" << metadata.frame_id << ",\"pts_ns\":" << metadata.pts_ns
 			<< ",\"observed_at_monotonic_ns\":" << observed_at_monotonic_ns
 			<< ",\"valid\":true,\"program_frame\":true,\"surface\":\"ProgramReturn\","
-			<< "\"consumer\":\"DirectShow\"}";
+			<< "\"consumer\":\"DirectShow\",\"queue_counters\":{"
+			<< "\"gap_count\":" << timing.queue_counters.gap_count
+			<< ",\"duplicate_count\":" << timing.queue_counters.duplicate_count
+			<< ",\"retry_count\":" << timing.queue_counters.retry_count
+			<< ",\"torn_count\":" << timing.queue_counters.torn_count << "}}";
 	if (timing_complete) {
 		observation.seekp(-1, std::ios_base::end);
 		observation << ",\"frame_entry_monotonic_ns\":" << timing.frame_entry_monotonic_ns

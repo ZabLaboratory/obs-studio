@@ -104,6 +104,22 @@ static void snapshot_runtime_frame(struct video_queue_frame_metadata *metadata)
 	calldata_free(&cd);
 }
 
+static enum video_queue_pixel_format queue_pixel_format(obs_output_t *output)
+{
+	const struct video_scale_info *conversion = obs_output_get_video_conversion(output);
+	/* Some obs_output implementations expose the conversion only after the
+	 * first data-capture callback.  The return outputs are created with the
+	 * canonical NV12 conversion, so keep the producer live during that short
+	 * initialization window instead of dropping every frame as INVALID. */
+	if (!conversion)
+		return VIDEO_QUEUE_PIXEL_FORMAT_NV12;
+	if (conversion->format == VIDEO_FORMAT_NV12)
+		return VIDEO_QUEUE_PIXEL_FORMAT_NV12;
+	if (conversion->format == VIDEO_FORMAT_P010)
+		return VIDEO_QUEUE_PIXEL_FORMAT_P010;
+	return VIDEO_QUEUE_PIXEL_FORMAT_INVALID;
+}
+
 static bool queue_name_for_output(obs_output_t *output, wchar_t *destination, size_t capacity)
 {
 	const char *output_name = obs_output_get_name(output);
@@ -261,7 +277,8 @@ static void virtual_video(void *param, struct video_data *frame)
 
 	struct video_queue_frame_metadata metadata;
 	snapshot_runtime_frame(&metadata);
-	video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp, &metadata);
+	(void)video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp,
+				   queue_pixel_format(vcam->output), &metadata);
 }
 
 struct obs_output_info virtualcam_info = {
