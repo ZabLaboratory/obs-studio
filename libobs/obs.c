@@ -2927,6 +2927,35 @@ uint64_t obs_get_frame_interval_ns(void)
 	return obs->video.video_frame_interval_ns;
 }
 
+bool obs_get_graphics_pipeline_stats(struct obs_graphics_pipeline_stats *stats)
+{
+	if (!obs || !stats)
+		return false;
+	pthread_mutex_lock(&obs->video.mixes_mutex);
+	*stats = obs->video.pipeline_stats;
+	pthread_mutex_unlock(&obs->video.mixes_mutex);
+	return true;
+}
+
+bool obs_video_get_mix_pipeline_stats(video_t *v, struct obs_video_mix_pipeline_stats *stats)
+{
+	if (!obs || !v || !stats)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&obs->video.mixes_mutex);
+	for (size_t i = 0, num = obs->video.mixes.num; i < num; i++) {
+		struct obs_core_video_mix *mix = obs->video.mixes.array[i];
+		if (mix->video == v) {
+			*stats = mix->pipeline_stats;
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&obs->video.mixes_mutex);
+	return found;
+}
+
 enum obs_obj_type obs_obj_get_type(void *obj)
 {
 	struct obs_context_data *context = obj;

@@ -399,6 +399,7 @@ struct obs_core_video_mix {
 	long encoder_refs;
 
 	bool mix_audio;
+	struct obs_video_mix_pipeline_stats pipeline_stats;
 };
 
 extern struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi);
@@ -424,6 +425,7 @@ struct obs_core_video {
 	uint64_t video_frame_interval_ns;
 	uint64_t video_half_frame_interval_ns;
 	uint64_t video_avg_frame_time_ns;
+	struct obs_graphics_pipeline_stats pipeline_stats;
 	double video_fps;
 	pthread_t video_thread;
 	uint32_t total_frames;

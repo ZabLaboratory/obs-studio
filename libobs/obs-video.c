@@ -869,6 +869,7 @@ static const char *output_frame_gs_flush_name = "gs_flush";
 static const char *output_frame_output_video_data_name = "output_video_data";
 static inline void output_frame(struct obs_core_video_mix *video)
 {
+	const uint64_t frame_start = os_gettime_ns();
 	const bool raw_active = video->raw_was_active;
 	const bool gpu_active = video->gpu_was_active;
 
@@ -883,19 +884,25 @@ static inline void output_frame(struct obs_core_video_mix *video)
 	gs_enter_context(obs->video.graphics);
 
 	profile_start(output_frame_render_video_name);
+	const uint64_t render_start = os_gettime_ns();
 	GS_DEBUG_MARKER_BEGIN(GS_DEBUG_COLOR_RENDER_VIDEO, output_frame_render_video_name);
 	render_video(video, raw_active, gpu_active, cur_texture);
+	video->pipeline_stats.render_submit_ns += os_gettime_ns() - render_start;
 	GS_DEBUG_MARKER_END();
 	profile_end(output_frame_render_video_name);
 
 	if (raw_active) {
 		profile_start(output_frame_download_frame_name);
+		const uint64_t download_start = os_gettime_ns();
 		frame_ready = download_frame(video, prev_texture, &frame);
+		video->pipeline_stats.download_ns += os_gettime_ns() - download_start;
 		profile_end(output_frame_download_frame_name);
 	}
 
 	profile_start(output_frame_gs_flush_name);
+	const uint64_t flush_start = os_gettime_ns();
 	gs_flush();
+	video->pipeline_stats.flush_ns += os_gettime_ns() - flush_start;
 	profile_end(output_frame_gs_flush_name);
 
 	gs_leave_context();
@@ -907,12 +914,16 @@ static inline void output_frame(struct obs_core_video_mix *video)
 
 		frame.timestamp = vframe_info.timestamp;
 		profile_start(output_frame_output_video_data_name);
+		const uint64_t output_start = os_gettime_ns();
 		output_video_data(video, &frame, vframe_info.count);
+		video->pipeline_stats.output_copy_ns += os_gettime_ns() - output_start;
 		profile_end(output_frame_output_video_data_name);
 	}
 
 	if (++video->cur_texture == NUM_TEXTURES)
 		video->cur_texture = 0;
+	video->pipeline_stats.frame_total_ns += os_gettime_ns() - frame_start;
+	video->pipeline_stats.sample_count++;
 }
 
 static inline void output_frames(void)
@@ -1100,6 +1111,11 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 {
 	uint64_t frame_start = os_gettime_ns();
 	uint64_t frame_time_ns;
+	uint64_t stage_start;
+	uint64_t tick_sources_ns;
+	uint64_t output_frames_ns;
+	uint64_t render_displays_ns;
+	uint64_t graphics_tasks_ns;
 
 	update_active_states();
 
@@ -1111,7 +1127,9 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 	gs_leave_context();
 
 	profile_start(tick_sources_name);
+	stage_start = os_gettime_ns();
 	context->last_time = tick_sources(obs->video.video_time, context->last_time);
+	tick_sources_ns = os_gettime_ns() - stage_start;
 	profile_end(tick_sources_name);
 
 #ifdef _WIN32
@@ -1124,21 +1142,35 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 
 	source_profiler_render_begin();
 	profile_start(output_frame_name);
+	stage_start = os_gettime_ns();
 	/* Apply the whole role swap before any mix renders this video tick.  The
 	 * callback runs on this graphics thread, after both view channel arrays are
 	 * replaced, so ProgramView and PreviewView cannot observe a mixed pair. */
 	obs_view_apply_pending_atomic_swap(++obs->video.video_frame_id, obs->video.video_time);
 	output_frames();
+	output_frames_ns = os_gettime_ns() - stage_start;
 	profile_end(output_frame_name);
 
 	profile_start(render_displays_name);
+	stage_start = os_gettime_ns();
 	render_displays();
+	render_displays_ns = os_gettime_ns() - stage_start;
 	profile_end(render_displays_name);
 	source_profiler_render_end();
 
+	stage_start = os_gettime_ns();
 	execute_graphics_tasks();
+	graphics_tasks_ns = os_gettime_ns() - stage_start;
 
 	frame_time_ns = os_gettime_ns() - frame_start;
+	pthread_mutex_lock(&obs->video.mixes_mutex);
+	obs->video.pipeline_stats.sample_count++;
+	obs->video.pipeline_stats.tick_sources_ns += tick_sources_ns;
+	obs->video.pipeline_stats.output_frames_ns += output_frames_ns;
+	obs->video.pipeline_stats.render_displays_ns += render_displays_ns;
+	obs->video.pipeline_stats.graphics_tasks_ns += graphics_tasks_ns;
+	obs->video.pipeline_stats.frame_total_ns += frame_time_ns;
+	pthread_mutex_unlock(&obs->video.mixes_mutex);
 
 	source_profiler_frame_collect();
 	profile_end(context->video_thread_name);

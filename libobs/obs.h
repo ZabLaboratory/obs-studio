@@ -910,6 +910,30 @@ EXPORT double obs_get_active_fps(void);
 EXPORT uint64_t obs_get_average_frame_time_ns(void);
 EXPORT uint64_t obs_get_frame_interval_ns(void);
 
+/* Cumulative host-CPU timings. Diff two snapshots for an interval average.
+ * Render values cover CPU submission; source-profiler remains authoritative
+ * for GPU execution time. */
+struct obs_graphics_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t tick_sources_ns;
+	uint64_t output_frames_ns;
+	uint64_t render_displays_ns;
+	uint64_t graphics_tasks_ns;
+	uint64_t frame_total_ns;
+};
+
+struct obs_video_mix_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t render_submit_ns;
+	uint64_t download_ns;
+	uint64_t flush_ns;
+	uint64_t output_copy_ns;
+	uint64_t frame_total_ns;
+};
+
+EXPORT bool obs_get_graphics_pipeline_stats(struct obs_graphics_pipeline_stats *stats);
+EXPORT bool obs_video_get_mix_pipeline_stats(video_t *video, struct obs_video_mix_pipeline_stats *stats);
+
 EXPORT uint32_t obs_get_total_frames(void);
 EXPORT uint32_t obs_get_lagged_frames(void);
 
