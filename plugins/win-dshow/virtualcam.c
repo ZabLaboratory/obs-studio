@@ -14,11 +14,31 @@ struct virtualcam_data {
 	obs_output_t *output;
 	video_queue_t *vq;
 	wchar_t queue_name[256];
+	wchar_t consumer_lease_name[288];
 	bool queue_namespace_rejected;
 	bool program_return;
+	bool preview_return;
+	volatile long preview_consumer_active;
 	volatile bool active;
 	volatile bool stopping;
 };
+
+static bool preview_consumer_is_active(struct virtualcam_data *vcam)
+{
+	if (!vcam->preview_return)
+		return true;
+
+	HANDLE lease = OpenEventW(SYNCHRONIZE, FALSE, vcam->consumer_lease_name);
+	const bool active = lease != NULL;
+	if (lease)
+		CloseHandle(lease);
+
+	const long previous = InterlockedExchange(&vcam->preview_consumer_active, active ? 1L : 0L);
+	if (previous != (active ? 1L : 0L))
+		blog(LOG_INFO, "[pulsar-directshow] PreviewReturn consumer %s (lease=%ls)",
+		     active ? "attached" : "detached", vcam->consumer_lease_name);
+	return active;
+}
 
 static void copy_telemetry_identifier(char *destination, const char *value)
 {
@@ -134,8 +154,14 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 	vcam->output = output;
 	vcam->program_return = obs_output_get_id(output) &&
 				       strcmp(obs_output_get_id(output), "program_return_output") == 0;
+	vcam->preview_return = obs_output_get_id(output) &&
+				       strcmp(obs_output_get_id(output), "preview_return_output") == 0;
 	vcam->queue_namespace_rejected = !queue_name_for_output(
 		output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
+	if (vcam->preview_return && !vcam->queue_namespace_rejected)
+		_snwprintf_s(vcam->consumer_lease_name,
+			     sizeof(vcam->consumer_lease_name) / sizeof(vcam->consumer_lease_name[0]), _TRUNCATE,
+			     L"%ls.ConsumerActive", vcam->queue_name);
 	if (vcam->queue_namespace_rejected)
 		blog(LOG_ERROR, "[pulsar-directshow] queue namespace rejected; producer is disabled");
 
@@ -223,6 +249,12 @@ static void virtual_video(void *param, struct video_data *frame)
 		virtualcam_deactive(vcam);
 		return;
 	}
+
+	/* Preview stays hot through the borrowed readiness callback.  Only the
+	 * optional shared-memory publication is elided while no DirectShow graph
+	 * actively consumes PreviewReturn. */
+	if (!preview_consumer_is_active(vcam))
+		return;
 
 	struct video_queue_frame_metadata metadata;
 	snapshot_runtime_frame(&metadata);

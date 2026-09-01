@@ -44,8 +44,11 @@ class VCamFilter : public DShow::OutputFilter {
 
 	video_queue_t *vq = nullptr;
 	std::wstring queue_name;
+	std::wstring consumer_lease_name;
 	bool queue_namespace_rejected = false;
 	bool program_return = false;
+	bool preview_return = false;
+	WinHandle consumer_lease;
 	int queue_mode = 0;
 	bool in_obs = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
@@ -73,6 +76,8 @@ class VCamFilter : public DShow::OutputFilter {
 	void ShowDefaultFrame(uint8_t *ptr);
 	void EmitDirectShowObservation(const struct video_queue_frame_metadata &metadata,
 					      const struct directshow_stage_timing &timing);
+	HRESULT AcquireConsumerLease();
+	void ReleaseConsumerLease();
 	void UpdatePlaceholder(void);
 	const int GetOutputBufferSize(void);
 

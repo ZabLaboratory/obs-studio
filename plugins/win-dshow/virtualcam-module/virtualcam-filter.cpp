@@ -52,9 +52,12 @@ VCamFilter::VCamFilter(enum directshow_consumer_filter_kind filter_kind)
 	: OutputFilter()
 {
 	program_return = filter_kind == DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN;
+	preview_return = filter_kind == DIRECTSHOW_CONSUMER_FILTER_PREVIEW_RETURN;
 	const enum directshow_queue_namespace queue_namespace = directshow_queue_namespace_for_consumer(filter_kind);
 	queue_namespace_rejected = queue_namespace == DIRECTSHOW_QUEUE_NAMESPACE_REJECT;
 	queue_name = queue_name_for_filter(queue_namespace, filter_kind);
+	if (preview_return && !queue_namespace_rejected)
+		consumer_lease_name = queue_name + L".ConsumerActive";
 	if (queue_namespace_rejected) {
 		OutputDebugStringW(L"[pulsar-directshow] queue namespace rejected; consumer is disabled\n");
 	}
@@ -144,6 +147,7 @@ VCamFilter::VCamFilter(enum directshow_consumer_filter_kind filter_kind)
 
 VCamFilter::~VCamFilter()
 {
+	ReleaseConsumerLease();
 	SetEvent(thread_stop);
 	if (th.joinable())
 		th.join();
@@ -153,6 +157,25 @@ VCamFilter::~VCamFilter()
 		free(placeholder.scaled_data);
 
 	os_atomic_dec_long(&locks);
+}
+
+HRESULT VCamFilter::AcquireConsumerLease()
+{
+	if (!preview_return || consumer_lease.Valid())
+		return S_OK;
+
+	consumer_lease = CreateEventW(nullptr, TRUE, FALSE, consumer_lease_name.c_str());
+	if (!consumer_lease.Valid()) {
+		const DWORD error = GetLastError();
+		OutputDebugStringW(L"[pulsar-directshow] failed to acquire PreviewReturn consumer lease\n");
+		return HRESULT_FROM_WIN32(error ? error : ERROR_OPEN_FAILED);
+	}
+	return S_OK;
+}
+
+void VCamFilter::ReleaseConsumerLease()
+{
+	consumer_lease = nullptr;
 }
 
 const wchar_t *VCamFilter::FilterName() const
@@ -168,6 +191,9 @@ STDMETHODIMP VCamFilter::Pause()
 	if (FAILED(hr)) {
 		return hr;
 	}
+	hr = AcquireConsumerLease();
+	if (FAILED(hr))
+		return hr;
 
 	os_atomic_set_bool(&active, true);
 	SetEvent(thread_start);
@@ -176,6 +202,9 @@ STDMETHODIMP VCamFilter::Pause()
 
 STDMETHODIMP VCamFilter::Run(REFERENCE_TIME tStart)
 {
+	HRESULT hr = AcquireConsumerLease();
+	if (FAILED(hr))
+		return hr;
 	os_atomic_set_bool(&active, true);
 	return OutputFilter::Run(tStart);
 }
@@ -183,6 +212,7 @@ STDMETHODIMP VCamFilter::Run(REFERENCE_TIME tStart)
 STDMETHODIMP VCamFilter::Stop()
 {
 	os_atomic_set_bool(&active, false);
+	ReleaseConsumerLease();
 	return OutputFilter::Stop();
 }
 
