@@ -48,6 +48,7 @@ class VCamFilter : public DShow::OutputFilter {
 	bool queue_namespace_rejected = false;
 	bool program_return = false;
 	bool preview_return = false;
+	bool consumer_gated = false;
 	WinHandle consumer_lease;
 	int queue_mode = 0;
 	bool in_obs = false;

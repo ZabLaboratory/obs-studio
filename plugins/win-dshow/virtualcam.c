@@ -18,14 +18,15 @@ struct virtualcam_data {
 	bool queue_namespace_rejected;
 	bool program_return;
 	bool preview_return;
-	volatile long preview_consumer_active;
+	bool consumer_gated;
+	volatile long consumer_active;
 	volatile bool active;
 	volatile bool stopping;
 };
 
-static bool preview_consumer_is_active(struct virtualcam_data *vcam)
+static bool return_consumer_is_active(struct virtualcam_data *vcam)
 {
-	if (!vcam->preview_return)
+	if (!vcam->consumer_gated)
 		return true;
 
 	HANDLE lease = OpenEventW(SYNCHRONIZE, FALSE, vcam->consumer_lease_name);
@@ -33,10 +34,11 @@ static bool preview_consumer_is_active(struct virtualcam_data *vcam)
 	if (lease)
 		CloseHandle(lease);
 
-	const long previous = InterlockedExchange(&vcam->preview_consumer_active, active ? 1L : 0L);
+	const long previous = InterlockedExchange(&vcam->consumer_active, active ? 1L : 0L);
 	if (previous != (active ? 1L : 0L))
-		blog(LOG_INFO, "[pulsar-directshow] PreviewReturn consumer %s (lease=%ls)",
-		     active ? "attached" : "detached", vcam->consumer_lease_name);
+		blog(LOG_INFO, "[pulsar-directshow] %s consumer %s (lease=%ls)",
+		     vcam->program_return ? "ProgramReturn" : "PreviewReturn", active ? "attached" : "detached",
+		     vcam->consumer_lease_name);
 	return active;
 }
 
@@ -156,9 +158,10 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 				       strcmp(obs_output_get_id(output), "program_return_output") == 0;
 	vcam->preview_return = obs_output_get_id(output) &&
 				       strcmp(obs_output_get_id(output), "preview_return_output") == 0;
+	vcam->consumer_gated = vcam->program_return || vcam->preview_return;
 	vcam->queue_namespace_rejected = !queue_name_for_output(
 		output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
-	if (vcam->preview_return && !vcam->queue_namespace_rejected)
+	if (vcam->consumer_gated && !vcam->queue_namespace_rejected)
 		_snwprintf_s(vcam->consumer_lease_name,
 			     sizeof(vcam->consumer_lease_name) / sizeof(vcam->consumer_lease_name[0]), _TRUNCATE,
 			     L"%ls.ConsumerActive", vcam->queue_name);
@@ -250,10 +253,10 @@ static void virtual_video(void *param, struct video_data *frame)
 		return;
 	}
 
-	/* Preview stays hot through the borrowed readiness callback.  Only the
-	 * optional shared-memory publication is elided while no DirectShow graph
-	 * actively consumes PreviewReturn. */
-	if (!preview_consumer_is_active(vcam))
+	/* Both compositions stay hot and Program encoding remains independent.
+	 * Only the optional DirectShow shared-memory publication is elided while
+	 * no graph actively consumes this return. */
+	if (!return_consumer_is_active(vcam))
 		return;
 
 	struct video_queue_frame_metadata metadata;
