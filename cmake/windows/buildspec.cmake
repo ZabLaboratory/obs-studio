@@ -9,7 +9,11 @@ function(_handle_qt_cross_compile architecture)
   set(options "")
   set(oneValueArgs DIRECTORY)
   set(multiValueArgs "")
-  cmake_parse_arguments(PARSE_ARGV 0 _HQCC "${options}" "${oneValueArgs}" "${multiValueArgs}")
+  # Argument zero is the named `architecture` parameter.  Parsing from zero
+  # makes its value an unparsed token and shifts DIRECTORY into `architecture`
+  # on a pristine configure, producing a bogus Qt host-tools path ending in
+  # `-DIRECTORY`.  Parse only the keyword arguments that follow it.
+  cmake_parse_arguments(PARSE_ARGV 1 _HQCC "${options}" "${oneValueArgs}" "${multiValueArgs}")
 
   _get_dependency_data(dependency_data)
 
@@ -102,7 +106,17 @@ function(_check_dependencies_windows)
   _check_dependencies(${dependencies_list})
 
   if(NOT CMAKE_VS_PLATFORM_NAME STREQUAL Win32)
-    _handle_qt_cross_compile(${CMAKE_HOST_SYSTEM_PROCESSOR} DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.deps/${qt6_destination}")
+    set(host_processor "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    if(NOT host_processor)
+      set(host_processor "$ENV{PROCESSOR_ARCHITEW6432}")
+    endif()
+    if(NOT host_processor)
+      set(host_processor "$ENV{PROCESSOR_ARCHITECTURE}")
+    endif()
+    if(NOT host_processor)
+      message(FATAL_ERROR "Unable to determine the Windows host processor for Qt host tools")
+    endif()
+    _handle_qt_cross_compile(${host_processor} DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.deps/${qt6_destination}")
   endif()
 endfunction()
 
