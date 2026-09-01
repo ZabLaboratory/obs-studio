@@ -547,18 +547,24 @@ end:
 static inline void render_video(struct obs_core_video_mix *video, bool raw_active, const bool gpu_active,
 				int cur_texture)
 {
+	uint64_t stage_start = os_gettime_ns();
 	gs_begin_scene();
 
 	gs_enable_depth_test(false);
 	gs_set_cull_mode(GS_NEITHER);
+	video->pipeline_stats.render_setup_ns += os_gettime_ns() - stage_start;
 
+	stage_start = os_gettime_ns();
 	render_main_texture(video);
+	video->pipeline_stats.render_main_ns += os_gettime_ns() - stage_start;
 
 	if (raw_active || gpu_active) {
 		gs_texture_t *const *convert_textures = video->convert_textures;
 		gs_stagesurf_t *const *copy_surfaces = video->copy_surfaces[cur_texture];
 		size_t channel_count = NUM_CHANNELS;
+		stage_start = os_gettime_ns();
 		gs_texture_t *output_texture = render_output_texture(video);
+		video->pipeline_stats.render_scale_ns += os_gettime_ns() - stage_start;
 
 		if (gpu_active) {
 			convert_textures = video->convert_textures_encode;
@@ -566,28 +572,40 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 			copy_surfaces = video->copy_surfaces_encode;
 			channel_count = 1;
 #endif
+			stage_start = os_gettime_ns();
 			gs_flush();
+			video->pipeline_stats.gpu_flush_ns += os_gettime_ns() - stage_start;
 		}
 
 		if (video->gpu_conversion) {
+			stage_start = os_gettime_ns();
 			render_convert_texture(video, convert_textures, output_texture);
+			video->pipeline_stats.render_convert_ns += os_gettime_ns() - stage_start;
 		}
 
 		if (gpu_active) {
+			stage_start = os_gettime_ns();
 			gs_flush();
+			video->pipeline_stats.gpu_flush_ns += os_gettime_ns() - stage_start;
+			stage_start = os_gettime_ns();
 			output_gpu_encoders(video, raw_active);
+			video->pipeline_stats.gpu_encode_submit_ns += os_gettime_ns() - stage_start;
 		}
 
 		if (raw_active) {
+			stage_start = os_gettime_ns();
 			stage_output_texture(video, cur_texture, convert_textures, output_texture, copy_surfaces,
 					     channel_count);
+			video->pipeline_stats.raw_stage_ns += os_gettime_ns() - stage_start;
 		}
 	}
 
+	stage_start = os_gettime_ns();
 	gs_set_render_target(NULL, NULL);
 	gs_enable_blending(true);
 
 	gs_end_scene();
+	video->pipeline_stats.render_teardown_ns += os_gettime_ns() - stage_start;
 }
 
 static inline bool download_frame(struct obs_core_video_mix *video, int prev_texture, struct video_data *frame)
@@ -935,7 +953,9 @@ static inline void output_frame(struct obs_core_video_mix *video)
 		deque_pop_front(&video->vframe_info_buffer, &vframe_info, sizeof(vframe_info));
 
 		frame.timestamp = vframe_info.timestamp;
+		const uint64_t borrowed_schedule_start = os_gettime_ns();
 		output_borrowed_video_data(video, &frame);
+		video->pipeline_stats.borrowed_schedule_ns += os_gettime_ns() - borrowed_schedule_start;
 		profile_start(output_frame_output_video_data_name);
 		const uint64_t output_start = os_gettime_ns();
 		if (video_output_active(video->video))

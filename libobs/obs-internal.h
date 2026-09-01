@@ -1268,6 +1268,8 @@ struct obs_output {
 	bool received_audio;
 	volatile bool data_active;
 	bool borrowed_video_active;
+	pthread_mutex_t raw_pipeline_mutex;
+	struct obs_raw_output_pipeline_stats raw_pipeline_stats;
 	volatile bool end_data_capture_thread_active;
 	int64_t video_offsets[MAX_OUTPUT_VIDEO_ENCODERS];
 	int64_t audio_offsets[MAX_OUTPUT_AUDIO_ENCODERS];

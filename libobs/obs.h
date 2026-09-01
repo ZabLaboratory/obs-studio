@@ -935,17 +935,33 @@ struct obs_graphics_pipeline_stats {
 struct obs_video_mix_pipeline_stats {
 	uint64_t sample_count;
 	uint64_t render_submit_ns;
+	uint64_t render_setup_ns;
+	uint64_t render_main_ns;
+	uint64_t render_scale_ns;
+	uint64_t render_convert_ns;
+	uint64_t gpu_flush_ns;
+	uint64_t gpu_encode_submit_ns;
+	uint64_t raw_stage_ns;
+	uint64_t render_teardown_ns;
 	uint64_t download_ns;
 	uint64_t flush_ns;
 	uint64_t output_copy_ns;
+	uint64_t borrowed_schedule_ns;
 	uint64_t borrowed_publish_sample_count;
 	uint64_t borrowed_publish_ns;
 	uint64_t borrowed_wait_ns;
 	uint64_t frame_total_ns;
 };
 
+struct obs_raw_output_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t callback_ns;
+};
+
 EXPORT bool obs_get_graphics_pipeline_stats(struct obs_graphics_pipeline_stats *stats);
 EXPORT bool obs_video_get_mix_pipeline_stats(video_t *video, struct obs_video_mix_pipeline_stats *stats);
+EXPORT bool obs_output_get_raw_pipeline_stats(const obs_output_t *output,
+					      struct obs_raw_output_pipeline_stats *stats);
 
 EXPORT uint32_t obs_get_total_frames(void);
 EXPORT uint32_t obs_get_lagged_frames(void);
