@@ -183,6 +183,17 @@ static bool queue_mapping_size(const void *mapping, size_t *mapping_size)
 	return true;
 }
 
+/* A producer can publish STOPPING while a DirectShow consumer is between
+ * timer ticks. Treat a view that was already unmapped (or whose section was
+ * replaced) as invalid before touching queue_header atomics. */
+static bool queue_mapping_live(const struct video_queue *vq)
+{
+	MEMORY_BASIC_INFORMATION info = {0};
+	return vq && vq->layout_valid && vq->header && vq->mapping_size &&
+		VirtualQuery(vq->header, &info, sizeof(info)) == sizeof(info) &&
+		info.State == MEM_COMMIT && info.RegionSize != 0;
+}
+
 static bool queue_layout_valid(const struct queue_header *header, size_t mapping_size,
 				       uint32_t frame_header_size)
 {
@@ -399,11 +410,13 @@ void video_queue_close(video_queue_t *vq)
 	if (!vq) {
 		return;
 	}
-	if (vq->is_writer) {
+	const bool mapping_live = queue_mapping_live(vq);
+	if (vq->is_writer && mapping_live) {
 		InterlockedExchange((volatile LONG *)&vq->header->state, SHARED_QUEUE_STATE_STOPPING);
 	}
 
-	UnmapViewOfFile(vq->header);
+	if (mapping_live)
+		UnmapViewOfFile(vq->header);
 	CloseHandle(vq->handle);
 	free(vq->read_buffer);
 	free(vq);
@@ -411,7 +424,7 @@ void video_queue_close(video_queue_t *vq)
 
 void video_queue_get_info(video_queue_t *vq, uint32_t *cx, uint32_t *cy, uint64_t *interval)
 {
-	if (!vq || !vq->layout_valid)
+	if (!queue_mapping_live(vq))
 		return;
 
 	struct queue_header *qh = vq->header;
@@ -429,7 +442,7 @@ bool video_queue_write_ex(video_queue_t *vq, uint8_t **data, uint32_t *linesize,
 				  enum video_queue_pixel_format format,
 				  const struct video_queue_frame_metadata *metadata)
 {
-	if (!vq || !vq->layout_valid || !vq->is_writer || !queue_validate_nv12(vq->header->cx, vq->header->cy,
+	if (!queue_mapping_live(vq) || !vq->is_writer || !queue_validate_nv12(vq->header->cx, vq->header->cy,
 							 data, linesize, format))
 		return false;
 
@@ -466,7 +479,7 @@ void video_queue_write(video_queue_t *vq, uint8_t **data, uint32_t *linesize, ui
 
 enum queue_state video_queue_state(video_queue_t *vq)
 {
-	if (!vq || !vq->layout_valid) {
+	if (!queue_mapping_live(vq)) {
 		return SHARED_QUEUE_STATE_INVALID;
 	}
 
@@ -483,7 +496,7 @@ bool video_queue_read_ex(video_queue_t *vq, nv12_scale_t *scale, void *dst, uint
 {
 	if (metadata)
 		memset(metadata, 0, sizeof(*metadata));
-	if (!vq || !vq->layout_valid || !vq->ready_to_read || !scale || !dst)
+	if (!queue_mapping_live(vq) || !vq->ready_to_read || !scale || !dst)
 		return false;
 
 	struct queue_header *qh = vq->header;

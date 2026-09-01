@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include "../directshow-namespace.h"
+#include "d3d11-return-transport.hpp"
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -38,6 +39,19 @@ struct directshow_stage_timing {
 	uint64_t unlock_sample_data_completed_monotonic_ns = 0;
 	uint64_t emission_monotonic_ns = 0;
 	struct video_queue_read_counters queue_counters = {};
+	uint32_t transport_path = PULSAR_D3D11_PATH_CPU;
+	uint32_t transport_fallback = PULSAR_D3D11_FALLBACK_NOT_REQUESTED;
+	int32_t transport_hresult = 0;
+	uint32_t transport_lane = 0;
+	uint64_t transport_epoch = 0;
+	uint64_t transport_produced_sequence = 0;
+	uint64_t transport_published_sequence = 0;
+	uint64_t transport_consumed_sequence = 0;
+	uint64_t transport_mutex_wait_ns = 0;
+	uint64_t transport_fence_wait_ns = 0;
+	uint64_t transport_gpu_copy_ns = 0;
+	uint64_t transport_readback_ns = 0;
+	uint64_t transport_frame_age_ns = 0;
 };
 
 class VCamFilter : public DShow::OutputFilter {
@@ -50,6 +64,8 @@ class VCamFilter : public DShow::OutputFilter {
 	bool program_return = false;
 	bool preview_return = false;
 	bool consumer_gated = false;
+	pulsar_d3d11_return_consumer_t *d3d11 = nullptr;
+	bool d3d11_requested = false;
 	WinHandle consumer_lease;
 	int queue_mode = 0;
 	bool in_obs = false;

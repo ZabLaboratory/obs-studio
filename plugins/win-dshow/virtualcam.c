@@ -8,6 +8,7 @@
 #include "util/threading.h"
 #include "../../shared/obs-shared-memory-queue/shared-memory-queue.h"
 #include "directshow-namespace.h"
+#include "virtualcam-module/d3d11-return-transport.hpp"
 #include "../../../plugins/pulsar-frontend-stub/include/pulsar-runtime-telemetry-abi.h"
 
 struct virtualcam_data {
@@ -20,6 +21,8 @@ struct virtualcam_data {
 	bool preview_return;
 	bool consumer_gated;
 	volatile long consumer_active;
+	pulsar_d3d11_return_producer_t *d3d11;
+	bool d3d11_requested;
 	volatile bool active;
 	volatile bool stopping;
 };
@@ -162,6 +165,7 @@ static const char *virtualcam_name(void *unused)
 static void virtualcam_destroy(void *data)
 {
 	struct virtualcam_data *vcam = (struct virtualcam_data *)data;
+	pulsar_d3d11_return_producer_close(vcam->d3d11);
 	video_queue_close(vcam->vq);
 	bfree(data);
 }
@@ -175,6 +179,8 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 	vcam->preview_return = obs_output_get_id(output) &&
 				       strcmp(obs_output_get_id(output), "preview_return_output") == 0;
 	vcam->consumer_gated = vcam->program_return || vcam->preview_return;
+	const char *transport = getenv("PULSAR_RETURN_TRANSPORT");
+	vcam->d3d11_requested = vcam->consumer_gated && transport && strcmp(transport, "d3d11") == 0;
 	vcam->queue_namespace_rejected = !queue_name_for_output(
 		output, vcam->queue_name, sizeof(vcam->queue_name) / sizeof(vcam->queue_name[0]));
 	if (vcam->consumer_gated && !vcam->queue_namespace_rejected)
@@ -223,6 +229,14 @@ static bool virtualcam_start(void *data)
 	vsi.width = width;
 	vsi.height = height;
 	obs_output_set_video_conversion(vcam->output, &vsi);
+	if (vcam->d3d11_requested) {
+		const enum pulsar_d3d11_return_lane lane = vcam->program_return ? PULSAR_D3D11_PROGRAM_RETURN
+										 : PULSAR_D3D11_PREVIEW_RETURN;
+		vcam->d3d11 = pulsar_d3d11_return_producer_create(vcam->queue_name, lane, width, height);
+		if (!vcam->d3d11)
+			blog(LOG_WARNING, "[pulsar-directshow] D3D11 %s control unavailable; using CPU return queue",
+			     vcam->program_return ? "ProgramReturn" : "PreviewReturn");
+	}
 
 	os_atomic_set_bool(&vcam->active, true);
 	os_atomic_set_bool(&vcam->stopping, false);
@@ -235,6 +249,8 @@ static bool virtualcam_start(void *data)
 static void virtualcam_deactive(struct virtualcam_data *vcam)
 {
 	obs_output_end_data_capture(vcam->output);
+	pulsar_d3d11_return_producer_close(vcam->d3d11);
+	vcam->d3d11 = NULL;
 	video_queue_close(vcam->vq);
 	vcam->vq = NULL;
 
@@ -277,8 +293,11 @@ static void virtual_video(void *param, struct video_data *frame)
 
 	struct video_queue_frame_metadata metadata;
 	snapshot_runtime_frame(&metadata);
-	(void)video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp,
-				   queue_pixel_format(vcam->output), &metadata);
+	const enum video_queue_pixel_format format = queue_pixel_format(vcam->output);
+	if (vcam->d3d11 && format == VIDEO_QUEUE_PIXEL_FORMAT_NV12 &&
+	    pulsar_d3d11_return_producer_write(vcam->d3d11, frame->data, frame->linesize, frame->timestamp, &metadata))
+		return;
+	(void)video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp, format, &metadata);
 }
 
 struct obs_output_info virtualcam_info = {

@@ -79,6 +79,8 @@ target_sources(
   obs-virtualcam-module
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/virtualcam-module.rc
+    d3d11-return-transport.cpp
+    d3d11-return-transport.hpp
     placeholder.cpp
     sleepto.c
     sleepto.h
@@ -102,6 +104,8 @@ target_link_libraries(
     gdiplus
     strmiids
     winmm
+    d3d11
+    dxgi
 )
 
 if(OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
