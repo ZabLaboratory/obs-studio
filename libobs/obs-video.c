@@ -125,6 +125,14 @@ static inline void set_render_size(uint32_t width, uint32_t height)
 
 static inline void unmap_last_surface(struct obs_core_video_mix *video)
 {
+	if (video->borrowed_video_initialized) {
+		const uint64_t wait_start = os_gettime_ns();
+		pthread_mutex_lock(&video->borrowed_video_mutex);
+		while (video->borrowed_video_pending || video->borrowed_video_busy)
+			pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+		video->pipeline_stats.borrowed_wait_ns += os_gettime_ns() - wait_start;
+		pthread_mutex_unlock(&video->borrowed_video_mutex);
+	}
 	for (int c = 0; c < NUM_CHANNELS; ++c) {
 		if (video->mapped_surfaces[c]) {
 			gs_stagesurface_unmap(video->mapped_surfaces[c]);
@@ -796,6 +804,20 @@ static inline void output_video_data(struct obs_core_video_mix *video, struct vi
 	}
 }
 
+static inline void output_borrowed_video_data(struct obs_core_video_mix *video, struct video_data *input_frame)
+{
+	if (!video->borrowed_video_initialized)
+		return;
+
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	if (video->borrowed_video_callbacks.num) {
+		video->borrowed_video_frame = *input_frame;
+		video->borrowed_video_pending = true;
+		pthread_cond_broadcast(&video->borrowed_video_cond);
+	}
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+}
+
 void add_ready_encoder_group(obs_encoder_t *encoder)
 {
 	obs_weak_encoder_t *weak = obs_encoder_get_weak_encoder(encoder);
@@ -913,9 +935,11 @@ static inline void output_frame(struct obs_core_video_mix *video)
 		deque_pop_front(&video->vframe_info_buffer, &vframe_info, sizeof(vframe_info));
 
 		frame.timestamp = vframe_info.timestamp;
+		output_borrowed_video_data(video, &frame);
 		profile_start(output_frame_output_video_data_name);
 		const uint64_t output_start = os_gettime_ns();
-		output_video_data(video, &frame, vframe_info.count);
+		if (video_output_active(video->video))
+			output_video_data(video, &frame, vframe_info.count);
 		video->pipeline_stats.output_copy_ns += os_gettime_ns() - output_start;
 		profile_end(output_frame_output_video_data_name);
 	}

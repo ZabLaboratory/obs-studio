@@ -83,6 +83,11 @@ struct obs_output_info {
 	/* raw audio callback for multi track outputs */
 	void (*raw_audio2)(void *data, size_t idx, struct audio_data *frames);
 
+	/* Optional synchronous-borrowed raw video callback.  Libobs invokes this
+	 * on a dedicated per-mix worker while the mapped staging frame remains
+	 * valid.  The callback must not retain frame pointers. */
+	void (*raw_video_borrowed)(void *data, struct video_data *frame);
+
 	/* required if OBS_OUTPUT_SERVICE */
 	const char *protocols;
 };

@@ -602,6 +602,77 @@ static inline void set_video_matrix(struct obs_core_video_mix *video, struct vid
 	memcpy(video->color_matrix, &mat, sizeof(float) * 16);
 }
 
+static void *borrowed_video_thread(void *data)
+{
+	struct obs_core_video_mix *video = data;
+
+	for (;;) {
+		pthread_mutex_lock(&video->borrowed_video_mutex);
+		while (!video->borrowed_video_pending && !video->borrowed_video_stop)
+			pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+
+		if (video->borrowed_video_stop) {
+			pthread_mutex_unlock(&video->borrowed_video_mutex);
+			break;
+		}
+
+		video->borrowed_video_pending = false;
+		video->borrowed_video_busy = true;
+		const uint64_t publish_start = os_gettime_ns();
+		for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+			struct obs_borrowed_video_callback *cb = &video->borrowed_video_callbacks.array[i];
+			cb->callback(cb->param, &video->borrowed_video_frame);
+		}
+		video->pipeline_stats.borrowed_publish_ns += os_gettime_ns() - publish_start;
+		video->pipeline_stats.borrowed_publish_sample_count++;
+		video->borrowed_video_busy = false;
+		pthread_cond_broadcast(&video->borrowed_video_cond);
+		pthread_mutex_unlock(&video->borrowed_video_mutex);
+	}
+
+	return NULL;
+}
+
+static bool init_borrowed_video(struct obs_core_video_mix *video)
+{
+	pthread_mutex_init_value(&video->borrowed_video_mutex);
+	if (pthread_mutex_init(&video->borrowed_video_mutex, NULL) != 0)
+		return false;
+	if (pthread_cond_init(&video->borrowed_video_cond, NULL) != 0) {
+		pthread_mutex_destroy(&video->borrowed_video_mutex);
+		pthread_mutex_init_value(&video->borrowed_video_mutex);
+		return false;
+	}
+	if (pthread_create(&video->borrowed_video_thread, NULL, borrowed_video_thread, video) != 0) {
+		pthread_cond_destroy(&video->borrowed_video_cond);
+		pthread_mutex_destroy(&video->borrowed_video_mutex);
+		pthread_mutex_init_value(&video->borrowed_video_mutex);
+		return false;
+	}
+	video->borrowed_video_initialized = true;
+	return true;
+}
+
+static void free_borrowed_video(struct obs_core_video_mix *video)
+{
+	if (!video->borrowed_video_initialized)
+		return;
+
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	while (video->borrowed_video_pending || video->borrowed_video_busy)
+		pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+	video->borrowed_video_stop = true;
+	pthread_cond_broadcast(&video->borrowed_video_cond);
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	pthread_join(video->borrowed_video_thread, NULL);
+
+	da_free(video->borrowed_video_callbacks);
+	pthread_cond_destroy(&video->borrowed_video_cond);
+	pthread_mutex_destroy(&video->borrowed_video_mutex);
+	pthread_mutex_init_value(&video->borrowed_video_mutex);
+	video->borrowed_video_initialized = false;
+}
+
 static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_mix *video, size_t cache_size)
 {
 	struct video_output_info vi;
@@ -651,6 +722,8 @@ static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_
 		return OBS_VIDEO_FAIL;
 
 	gs_leave_context();
+	if (!init_borrowed_video(video))
+		return OBS_VIDEO_FAIL;
 
 	return OBS_VIDEO_SUCCESS;
 }
@@ -808,6 +881,7 @@ static void obs_free_render_textures(struct obs_core_video_mix *video)
 
 void obs_free_video_mix(struct obs_core_video_mix *video)
 {
+	free_borrowed_video(video);
 	if (video->video) {
 		video_output_close(video->video);
 		video->video = NULL;
@@ -2947,7 +3021,9 @@ bool obs_video_get_mix_pipeline_stats(video_t *v, struct obs_video_mix_pipeline_
 	for (size_t i = 0, num = obs->video.mixes.num; i < num; i++) {
 		struct obs_core_video_mix *mix = obs->video.mixes.array[i];
 		if (mix->video == v) {
+			pthread_mutex_lock(&mix->borrowed_video_mutex);
 			*stats = mix->pipeline_stats;
+			pthread_mutex_unlock(&mix->borrowed_video_mutex);
 			found = true;
 			break;
 		}
@@ -3178,6 +3254,62 @@ void stop_raw_video(video_t *v, void (*callback)(void *param, struct video_data 
 	// https://github.com/obsproject/obs-studio/issues/12366
 	if (video_output_disconnect2(v, callback, param) && video)
 		os_atomic_dec_long(&video->raw_active);
+}
+
+bool start_borrowed_raw_video(video_t *v, void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	struct obs_core_video_mix *video = get_mix_for_video(v);
+	if (!video || !callback || !video->borrowed_video_initialized)
+		return false;
+
+	struct obs_borrowed_video_callback cb = {callback, param};
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+		struct obs_borrowed_video_callback *existing = &video->borrowed_video_callbacks.array[i];
+		if (existing->callback == callback && existing->param == param) {
+			pthread_mutex_unlock(&video->borrowed_video_mutex);
+			return false;
+		}
+	}
+	da_push_back(video->borrowed_video_callbacks, &cb);
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	os_atomic_inc_long(&video->raw_active);
+	return true;
+}
+
+void stop_borrowed_raw_video(video_t *v, void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	struct obs_core_video_mix *video = get_mix_for_video(v);
+	if (!video || !callback || !video->borrowed_video_initialized)
+		return;
+
+	bool removed = false;
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	while (video->borrowed_video_pending || video->borrowed_video_busy)
+		pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+	for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+		struct obs_borrowed_video_callback *existing = &video->borrowed_video_callbacks.array[i];
+		if (existing->callback == callback && existing->param == param) {
+			da_erase(video->borrowed_video_callbacks, i);
+			removed = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	if (removed)
+		os_atomic_dec_long(&video->raw_active);
+}
+
+bool obs_video_add_borrowed_callback(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				     void *param)
+{
+	return start_borrowed_raw_video(video, callback, param);
+}
+
+void obs_video_remove_borrowed_callback(video_t *video, void (*callback)(void *param, struct video_data *frame),
+					void *param)
+{
+	stop_borrowed_raw_video(video, callback, param);
 }
 
 void obs_add_raw_video_callback(const struct video_scale_info *conversion,

@@ -347,6 +347,11 @@ struct obs_task_info {
 	void *param;
 };
 
+struct obs_borrowed_video_callback {
+	void (*callback)(void *param, struct video_data *frame);
+	void *param;
+};
+
 struct obs_core_video_mix {
 	struct obs_view *view;
 
@@ -370,6 +375,15 @@ struct obs_core_video_mix {
 	gs_stagesurf_t *mapped_surfaces[NUM_CHANNELS];
 	int cur_texture;
 	volatile long raw_active;
+	pthread_mutex_t borrowed_video_mutex;
+	pthread_cond_t borrowed_video_cond;
+	pthread_t borrowed_video_thread;
+	DARRAY(struct obs_borrowed_video_callback) borrowed_video_callbacks;
+	struct video_data borrowed_video_frame;
+	bool borrowed_video_initialized;
+	bool borrowed_video_pending;
+	bool borrowed_video_busy;
+	bool borrowed_video_stop;
 	volatile long gpu_encoder_active;
 	bool gpu_was_active;
 	bool raw_was_active;
@@ -637,6 +651,10 @@ extern struct obs_core_video_mix *get_mix_for_video(video_t *video);
 extern void start_raw_video(video_t *video, const struct video_scale_info *conversion, uint32_t frame_rate_divisor,
 			    void (*callback)(void *param, struct video_data *frame), void *param);
 extern void stop_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame), void *param);
+extern bool start_borrowed_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				     void *param);
+extern void stop_borrowed_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				    void *param);
 
 /* ------------------------------------------------------------------------- */
 /* obs shared context data */
@@ -1249,6 +1267,7 @@ struct obs_output {
 	DARRAY(struct keyframe_group_data) keyframe_group_tracking;
 	bool received_audio;
 	volatile bool data_active;
+	bool borrowed_video_active;
 	volatile bool end_data_capture_thread_active;
 	int64_t video_offsets[MAX_OUTPUT_VIDEO_ENCODERS];
 	int64_t audio_offsets[MAX_OUTPUT_AUDIO_ENCODERS];

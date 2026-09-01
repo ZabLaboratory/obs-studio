@@ -900,6 +900,16 @@ EXPORT void obs_add_raw_video_callback2(const struct video_scale_info *conversio
 					void (*callback)(void *param, struct video_data *frame), void *param);
 EXPORT void obs_remove_raw_video_callback(void (*callback)(void *param, struct video_data *frame), void *param);
 
+/**
+ * Adds/removes a raw callback that borrows the mix's native mapped frame.
+ * The callback runs asynchronously before the staging surface is reused and
+ * must not retain frame pointers.  No scaling or format conversion is done.
+ */
+EXPORT bool obs_video_add_borrowed_callback(video_t *video,
+					    void (*callback)(void *param, struct video_data *frame), void *param);
+EXPORT void obs_video_remove_borrowed_callback(video_t *video,
+					       void (*callback)(void *param, struct video_data *frame), void *param);
+
 EXPORT void obs_add_raw_audio_callback(size_t mix_idx, const struct audio_convert_info *conversion,
 				       audio_output_callback_t callback, void *param);
 EXPORT void obs_remove_raw_audio_callback(size_t mix_idx, audio_output_callback_t callback, void *param);
@@ -928,6 +938,9 @@ struct obs_video_mix_pipeline_stats {
 	uint64_t download_ns;
 	uint64_t flush_ns;
 	uint64_t output_copy_ns;
+	uint64_t borrowed_publish_sample_count;
+	uint64_t borrowed_publish_ns;
+	uint64_t borrowed_wait_ns;
 	uint64_t frame_total_ns;
 };
 

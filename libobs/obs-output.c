@@ -2525,6 +2525,23 @@ static inline bool preserve_active(struct obs_output *output)
 	return (output->delay_flags & OBS_OUTPUT_DELAY_PRESERVE) != 0;
 }
 
+static bool can_borrow_raw_video(const struct obs_output *output)
+{
+	if (!output->info.raw_video_borrowed || !output->video)
+		return false;
+
+	const struct video_scale_info *conversion = obs_output_get_video_conversion((obs_output_t *)output);
+	const struct video_output_info *native = video_output_get_info(output->video);
+	if (!native)
+		return false;
+	if (!conversion)
+		return true;
+
+	return conversion->format == native->format &&
+	       (!conversion->width || conversion->width == native->width) &&
+	       (!conversion->height || conversion->height == native->height);
+}
+
 static void hook_data_capture(struct obs_output *output)
 {
 	encoded_callback_t encoded_callback;
@@ -2556,9 +2573,14 @@ static void hook_data_capture(struct obs_output *output)
 		if (has_video)
 			start_video_encoders(output, encoded_callback);
 	} else {
-		if (has_video)
-			start_raw_video(output->video, obs_output_get_video_conversion(output), 1,
-					default_raw_video_callback, output);
+		if (has_video) {
+			output->borrowed_video_active = can_borrow_raw_video(output) &&
+							start_borrowed_raw_video(output->video, default_raw_video_callback,
+										 output);
+			if (!output->borrowed_video_active)
+				start_raw_video(output->video, obs_output_get_video_conversion(output), 1,
+						default_raw_video_callback, output);
+		}
 		if (has_audio)
 			start_raw_audio(output);
 	}
@@ -2892,8 +2914,13 @@ static void *end_data_capture_thread(void *data)
 		if (has_audio)
 			stop_audio_encoders(output, encoded_callback);
 	} else {
-		if (has_video)
-			stop_raw_video(output->video, default_raw_video_callback, output);
+		if (has_video) {
+			if (output->borrowed_video_active)
+				stop_borrowed_raw_video(output->video, default_raw_video_callback, output);
+			else
+				stop_raw_video(output->video, default_raw_video_callback, output);
+			output->borrowed_video_active = false;
+		}
 		if (has_audio)
 			stop_raw_audio(output);
 	}
