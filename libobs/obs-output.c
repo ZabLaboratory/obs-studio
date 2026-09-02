@@ -204,7 +204,6 @@ obs_output_t *obs_output_create(const char *id, const char *name, obs_data_t *se
 	pthread_mutex_init_value(&output->delay_mutex);
 	pthread_mutex_init_value(&output->pause.mutex);
 	pthread_mutex_init_value(&output->pkt_callbacks_mutex);
-	pthread_mutex_init_value(&output->raw_pipeline_mutex);
 
 	if (pthread_mutex_init(&output->interleaved_mutex, NULL) != 0)
 		goto fail;
@@ -213,8 +212,6 @@ obs_output_t *obs_output_create(const char *id, const char *name, obs_data_t *se
 	if (pthread_mutex_init(&output->pause.mutex, NULL) != 0)
 		goto fail;
 	if (pthread_mutex_init(&output->pkt_callbacks_mutex, NULL) != 0)
-		goto fail;
-	if (pthread_mutex_init(&output->raw_pipeline_mutex, NULL) != 0)
 		goto fail;
 	if (os_event_init(&output->stopping_event, OS_EVENT_TYPE_MANUAL) != 0)
 		goto fail;
@@ -343,7 +340,6 @@ void obs_output_destroy(obs_output_t *output)
 		pthread_mutex_destroy(&output->interleaved_mutex);
 		pthread_mutex_destroy(&output->delay_mutex);
 		pthread_mutex_destroy(&output->pkt_callbacks_mutex);
-		pthread_mutex_destroy(&output->raw_pipeline_mutex);
 		os_event_destroy(output->reconnect_stop_event);
 		obs_context_data_free(&output->context);
 		deque_free(&output->delay_data);
@@ -2380,10 +2376,8 @@ static void default_raw_video_callback(void *param, struct video_data *frame)
 	if (data_active(output))
 		output->info.raw_video(output->context.data, frame);
 	output->total_frames++;
-	pthread_mutex_lock(&output->raw_pipeline_mutex);
-	output->raw_pipeline_stats.callback_ns += os_gettime_ns() - callback_start;
-	output->raw_pipeline_stats.sample_count++;
-	pthread_mutex_unlock(&output->raw_pipeline_mutex);
+	obs_pipeline_stats_add_u64(&output->raw_pipeline_stats.callback_ns, os_gettime_ns() - callback_start);
+	obs_pipeline_stats_add_u64(&output->raw_pipeline_stats.sample_count, 1);
 }
 
 bool obs_output_get_raw_pipeline_stats(const obs_output_t *output, struct obs_raw_output_pipeline_stats *stats)
@@ -2391,9 +2385,8 @@ bool obs_output_get_raw_pipeline_stats(const obs_output_t *output, struct obs_ra
 	if (!obs_output_valid(output, "obs_output_get_raw_pipeline_stats") || !stats || flag_encoded(output))
 		return false;
 
-	pthread_mutex_lock((pthread_mutex_t *)&output->raw_pipeline_mutex);
-	*stats = output->raw_pipeline_stats;
-	pthread_mutex_unlock((pthread_mutex_t *)&output->raw_pipeline_mutex);
+	stats->sample_count = obs_pipeline_stats_load_u64(&output->raw_pipeline_stats.sample_count);
+	stats->callback_ns = obs_pipeline_stats_load_u64(&output->raw_pipeline_stats.callback_ns);
 	return true;
 }
 

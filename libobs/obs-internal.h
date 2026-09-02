@@ -42,6 +42,27 @@
 #include <obsversion.h>
 #include <caption/caption.h>
 
+/* Pipeline telemetry is updated from graphics, borrowed-video and output
+ * callback threads.  Keep the counters ABI-compatible with the public plain
+ * uint64_t snapshots while making every producer update/read atomic. */
+static inline void obs_pipeline_stats_add_u64(volatile uint64_t *value, uint64_t delta)
+{
+#ifdef _WIN32
+	_InterlockedExchangeAdd64((volatile long long *)value, (long long)delta);
+#else
+	__atomic_fetch_add(value, delta, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline uint64_t obs_pipeline_stats_load_u64(const volatile uint64_t *value)
+{
+#ifdef _WIN32
+	return (uint64_t)_InterlockedCompareExchange64((volatile long long *)value, 0, 0);
+#else
+	return __atomic_load_n(value, __ATOMIC_RELAXED);
+#endif
+}
+
 /* Custom helpers for the UUID hash table */
 #define HASH_FIND_UUID(head, uuid, out) HASH_FIND(hh_uuid, head, uuid, UUID_STR_LENGTH, out)
 #define HASH_ADD_UUID(head, uuid_field, add) HASH_ADD(hh_uuid, head, uuid_field[0], UUID_STR_LENGTH, add)
@@ -1268,7 +1289,6 @@ struct obs_output {
 	bool received_audio;
 	volatile bool data_active;
 	bool borrowed_video_active;
-	pthread_mutex_t raw_pipeline_mutex;
 	struct obs_raw_output_pipeline_stats raw_pipeline_stats;
 	volatile bool end_data_capture_thread_active;
 	int64_t video_offsets[MAX_OUTPUT_VIDEO_ENCODERS];

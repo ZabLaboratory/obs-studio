@@ -130,7 +130,7 @@ static inline void unmap_last_surface(struct obs_core_video_mix *video)
 		pthread_mutex_lock(&video->borrowed_video_mutex);
 		while (video->borrowed_video_pending || video->borrowed_video_busy)
 			pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
-		video->pipeline_stats.borrowed_wait_ns += os_gettime_ns() - wait_start;
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.borrowed_wait_ns, os_gettime_ns() - wait_start);
 		pthread_mutex_unlock(&video->borrowed_video_mutex);
 	}
 	for (int c = 0; c < NUM_CHANNELS; ++c) {
@@ -552,11 +552,11 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 
 	gs_enable_depth_test(false);
 	gs_set_cull_mode(GS_NEITHER);
-	video->pipeline_stats.render_setup_ns += os_gettime_ns() - stage_start;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.render_setup_ns, os_gettime_ns() - stage_start);
 
 	stage_start = os_gettime_ns();
 	render_main_texture(video);
-	video->pipeline_stats.render_main_ns += os_gettime_ns() - stage_start;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.render_main_ns, os_gettime_ns() - stage_start);
 
 	if (raw_active || gpu_active) {
 		gs_texture_t *const *convert_textures = video->convert_textures;
@@ -564,7 +564,7 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 		size_t channel_count = NUM_CHANNELS;
 		stage_start = os_gettime_ns();
 		gs_texture_t *output_texture = render_output_texture(video);
-		video->pipeline_stats.render_scale_ns += os_gettime_ns() - stage_start;
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.render_scale_ns, os_gettime_ns() - stage_start);
 
 		if (gpu_active) {
 			convert_textures = video->convert_textures_encode;
@@ -574,29 +574,29 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 #endif
 			stage_start = os_gettime_ns();
 			gs_flush();
-			video->pipeline_stats.gpu_flush_ns += os_gettime_ns() - stage_start;
+			obs_pipeline_stats_add_u64(&video->pipeline_stats.gpu_flush_ns, os_gettime_ns() - stage_start);
 		}
 
 		if (video->gpu_conversion) {
 			stage_start = os_gettime_ns();
 			render_convert_texture(video, convert_textures, output_texture);
-			video->pipeline_stats.render_convert_ns += os_gettime_ns() - stage_start;
+			obs_pipeline_stats_add_u64(&video->pipeline_stats.render_convert_ns, os_gettime_ns() - stage_start);
 		}
 
 		if (gpu_active) {
 			stage_start = os_gettime_ns();
 			gs_flush();
-			video->pipeline_stats.gpu_flush_ns += os_gettime_ns() - stage_start;
+			obs_pipeline_stats_add_u64(&video->pipeline_stats.gpu_flush_ns, os_gettime_ns() - stage_start);
 			stage_start = os_gettime_ns();
 			output_gpu_encoders(video, raw_active);
-			video->pipeline_stats.gpu_encode_submit_ns += os_gettime_ns() - stage_start;
+			obs_pipeline_stats_add_u64(&video->pipeline_stats.gpu_encode_submit_ns, os_gettime_ns() - stage_start);
 		}
 
 		if (raw_active) {
 			stage_start = os_gettime_ns();
 			stage_output_texture(video, cur_texture, convert_textures, output_texture, copy_surfaces,
 					     channel_count);
-			video->pipeline_stats.raw_stage_ns += os_gettime_ns() - stage_start;
+			obs_pipeline_stats_add_u64(&video->pipeline_stats.raw_stage_ns, os_gettime_ns() - stage_start);
 		}
 	}
 
@@ -605,7 +605,7 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 	gs_enable_blending(true);
 
 	gs_end_scene();
-	video->pipeline_stats.render_teardown_ns += os_gettime_ns() - stage_start;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.render_teardown_ns, os_gettime_ns() - stage_start);
 }
 
 static inline bool download_frame(struct obs_core_video_mix *video, int prev_texture, struct video_data *frame)
@@ -936,7 +936,7 @@ static inline void output_frame(struct obs_core_video_mix *video)
 	const uint64_t render_start = os_gettime_ns();
 	GS_DEBUG_MARKER_BEGIN(GS_DEBUG_COLOR_RENDER_VIDEO, output_frame_render_video_name);
 	render_video(video, raw_active, gpu_active, cur_texture);
-	video->pipeline_stats.render_submit_ns += os_gettime_ns() - render_start;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.render_submit_ns, os_gettime_ns() - render_start);
 	GS_DEBUG_MARKER_END();
 	profile_end(output_frame_render_video_name);
 
@@ -944,14 +944,14 @@ static inline void output_frame(struct obs_core_video_mix *video)
 		profile_start(output_frame_download_frame_name);
 		const uint64_t download_start = os_gettime_ns();
 		frame_ready = download_frame(video, prev_texture, &frame);
-		video->pipeline_stats.download_ns += os_gettime_ns() - download_start;
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.download_ns, os_gettime_ns() - download_start);
 		profile_end(output_frame_download_frame_name);
 	}
 
 	profile_start(output_frame_gs_flush_name);
 	const uint64_t flush_start = os_gettime_ns();
 	gs_flush();
-	video->pipeline_stats.flush_ns += os_gettime_ns() - flush_start;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.flush_ns, os_gettime_ns() - flush_start);
 	profile_end(output_frame_gs_flush_name);
 
 	gs_leave_context();
@@ -964,19 +964,20 @@ static inline void output_frame(struct obs_core_video_mix *video)
 		frame.timestamp = vframe_info.timestamp;
 		const uint64_t borrowed_schedule_start = os_gettime_ns();
 		output_borrowed_video_data(video, &frame);
-		video->pipeline_stats.borrowed_schedule_ns += os_gettime_ns() - borrowed_schedule_start;
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.borrowed_schedule_ns,
+					   os_gettime_ns() - borrowed_schedule_start);
 		profile_start(output_frame_output_video_data_name);
 		const uint64_t output_start = os_gettime_ns();
 		if (video_output_active(video->video))
 			output_video_data(video, &frame, vframe_info.count);
-		video->pipeline_stats.output_copy_ns += os_gettime_ns() - output_start;
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.output_copy_ns, os_gettime_ns() - output_start);
 		profile_end(output_frame_output_video_data_name);
 	}
 
 	if (++video->cur_texture == NUM_TEXTURES)
 		video->cur_texture = 0;
-	video->pipeline_stats.frame_total_ns += os_gettime_ns() - frame_start;
-	video->pipeline_stats.sample_count++;
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.frame_total_ns, os_gettime_ns() - frame_start);
+	obs_pipeline_stats_add_u64(&video->pipeline_stats.sample_count, 1);
 }
 
 static inline void output_frames(void)
@@ -1216,14 +1217,12 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 	graphics_tasks_ns = os_gettime_ns() - stage_start;
 
 	frame_time_ns = os_gettime_ns() - frame_start;
-	pthread_mutex_lock(&obs->video.mixes_mutex);
-	obs->video.pipeline_stats.sample_count++;
-	obs->video.pipeline_stats.tick_sources_ns += tick_sources_ns;
-	obs->video.pipeline_stats.output_frames_ns += output_frames_ns;
-	obs->video.pipeline_stats.render_displays_ns += render_displays_ns;
-	obs->video.pipeline_stats.graphics_tasks_ns += graphics_tasks_ns;
-	obs->video.pipeline_stats.frame_total_ns += frame_time_ns;
-	pthread_mutex_unlock(&obs->video.mixes_mutex);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.sample_count, 1);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.tick_sources_ns, tick_sources_ns);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.output_frames_ns, output_frames_ns);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.render_displays_ns, render_displays_ns);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.graphics_tasks_ns, graphics_tasks_ns);
+	obs_pipeline_stats_add_u64(&obs->video.pipeline_stats.frame_total_ns, frame_time_ns);
 
 	source_profiler_frame_collect();
 	profile_end(context->video_thread_name);
