@@ -2303,6 +2303,9 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	else
 		check_received(output, packet);
 
+	if (output_packet_time)
+		output_packet_time->output_enqueue_monotonic_ns = os_gettime_ns();
+
 	insert_interleaved_packet(output, &out);
 
 	received_video = true;

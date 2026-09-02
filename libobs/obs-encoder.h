@@ -93,6 +93,10 @@ struct encoder_packet_time {
 	 * and packet interleaving.
 	 */
 	uint64_t pir;
+
+	/* Output/mux enqueue boundary, captured immediately before the packet is
+	 * inserted into the output interleave queue. */
+	uint64_t output_enqueue_monotonic_ns;
 };
 
 /** Encoder output packet */
