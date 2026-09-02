@@ -133,6 +133,18 @@ VCamFilter::VCamFilter(enum directshow_consumer_filter_kind filter_kind)
 			CloseHandle(file);
 		}
 	}
+	/* ProgramReturn/PreviewReturn outputs are consumer-gated: before a
+	 * DirectShow graph attaches, their producer intentionally does not publish
+	 * a frame, so the queue remains STARTING.  Do not leave the OutputPin with
+	 * a zero-sized media type in that bootstrap window; that creates a producer
+	 * / consumer deadlock because FFmpeg cannot attach to acquire the consumer
+	 * lease.  Pulsar's return contract is fixed at 1920x1080/60, and the queue
+	 * will replace these defaults on the first READY frame. */
+	if (consumer_gated && (!new_obs_cx || !new_obs_cy || !new_obs_interval)) {
+		new_obs_cx = PULSAR_D3D11_RETURN_WIDTH;
+		new_obs_cy = PULSAR_D3D11_RETURN_HEIGHT;
+		new_obs_interval = 10000000ULL / 60ULL;
+	}
 
 	if (new_obs_cx != obs_cx || new_obs_cy != obs_cy || new_obs_interval != obs_interval) {
 		AddVideoFormat(VideoFormat::NV12, new_obs_cx, new_obs_cy, new_obs_interval);
