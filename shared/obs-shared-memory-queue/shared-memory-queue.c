@@ -125,6 +125,16 @@ static bool queue_validate_nv12(uint32_t cx, uint32_t cy, uint8_t **data, uint32
 static void queue_copy_nv12(uint8_t *destination, uint8_t **data, const uint32_t *linesize,
 				    uint32_t cx, uint32_t cy)
 {
+	/* OBS normally supplies tightly packed NV12 to the return outputs.  Keep
+	 * the row-wise copy for padded frames, but collapse the common case to two
+	 * bulk copies without changing the validated bounds or layout. */
+	if (linesize[0] == cx && linesize[1] == cx) {
+		const size_t y_size = (size_t)cx * cy;
+		memcpy(destination, data[0], y_size);
+		memcpy(destination + y_size, data[1], y_size / 2U);
+		return;
+	}
+
 	for (uint32_t row = 0; row < cy; ++row)
 		memcpy(destination + (size_t)row * cx, data[0] + (size_t)row * linesize[0], cx);
 
