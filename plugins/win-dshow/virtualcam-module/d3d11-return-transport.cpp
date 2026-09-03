@@ -311,6 +311,13 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 	const uint32_t pid = producer->control->consumer_pid;
 	if (!pid)
 		return false;
+	const uint32_t consumer_session = process_session(pid);
+	if (consumer_session == UINT32_MAX || producer->control->consumer_session != consumer_session) {
+		/* A recycled PID from another Windows session is not the consumer that
+		 * published this control block.  Reject it before duplicating handles. */
+		set_fallback(producer->control, PULSAR_D3D11_FALLBACK_INTEROP, E_ACCESSDENIED);
+		return false;
+	}
 	if (producer->consumer_pid == pid && producer->consumer_process &&
 		WaitForSingleObject(producer->consumer_process, 0) != WAIT_TIMEOUT) {
 		/* The consumer disappeared (or the liveness query failed). Do not
@@ -549,7 +556,15 @@ extern "C" pulsar_d3d11_return_consumer_t *pulsar_d3d11_return_consumer_open(
 	consumer->control->consumer_session = process_session(consumer->control->consumer_pid);
 	consumer->consumer_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
 		consumer->control->consumer_pid);
+	if (!consumer->consumer_process) {
+		UnmapViewOfFile(consumer->control);
+		CloseHandle(consumer->mapping);
+		delete consumer;
+		return nullptr;
+	}
 	if (!consumer_open_ring(consumer) && consumer->control->selected_path != PULSAR_D3D11_PATH_CPU) {
+		CloseHandle(consumer->consumer_process);
+		consumer->consumer_process = nullptr;
 		UnmapViewOfFile(consumer->control);
 		CloseHandle(consumer->mapping);
 		delete consumer;
