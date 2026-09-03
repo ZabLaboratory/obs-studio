@@ -323,6 +323,12 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 		/* The consumer disappeared (or the liveness query failed). Do not
 		 * keep publishing into a stale ring or attempt a hot rebind. */
 		InterlockedExchange((volatile LONG *)&producer->control->consumer_ready, 0);
+		/* Invalidate the published registration as well. A later consumer must
+		 * explicitly register again; a recycled PID must never inherit the old
+		 * D3D11 sink. */
+		if (InterlockedCompareExchange((volatile LONG *)&producer->control->consumer_pid, 0, (LONG)pid) ==
+		    (LONG)pid)
+			InterlockedExchange((volatile LONG *)&producer->control->consumer_session, 0);
 		producer_release_ring(producer);
 		return false;
 	}
@@ -579,8 +585,12 @@ extern "C" void pulsar_d3d11_return_consumer_close(pulsar_d3d11_return_consumer_
 		return;
 	if (consumer->consumer_process)
 		CloseHandle(consumer->consumer_process);
-	if (consumer->control)
+	if (consumer->control) {
 		InterlockedExchange((volatile LONG *)&consumer->control->consumer_ready, 0);
+		const LONG pid = (LONG)GetCurrentProcessId();
+		if (InterlockedCompareExchange((volatile LONG *)&consumer->control->consumer_pid, 0, pid) == pid)
+			InterlockedExchange((volatile LONG *)&consumer->control->consumer_session, 0);
+	}
 	consumer->active = false;
 	if (consumer->control)
 		UnmapViewOfFile(consumer->control);
