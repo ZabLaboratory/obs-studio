@@ -331,6 +331,14 @@ video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_t inter
 	if (!vq.handle) {
 		return NULL;
 	}
+	// OpenFileMappingW above is only a best-effort preflight.  Another
+	// producer can win the race before CreateFileMappingW; reject that case
+	// instead of attaching to a mapping owned by a different runtime.
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		CloseHandle(vq.handle);
+		vq.handle = NULL;
+		return NULL;
+	}
 
 	vq.header = (struct queue_header *)MapViewOfFile(vq.handle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
 	if (!vq.header) {
