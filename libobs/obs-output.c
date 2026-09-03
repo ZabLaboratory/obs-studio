@@ -2260,6 +2260,7 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	bool was_started;
 	bool received_video;
 	struct encoder_packet_time *output_packet_time = NULL;
+	const uint64_t interleaved_mutex_wait_start = os_gettime_ns();
 
 	if (!active(output))
 		return;
@@ -2267,6 +2268,7 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	packet->track_idx = get_encoder_index(output, packet);
 
 	pthread_mutex_lock(&output->interleaved_mutex);
+	const uint64_t interleaved_mutex_acquired = os_gettime_ns();
 
 	/* if first video frame is not a keyframe, discard until received */
 	if (packet->type == OBS_ENCODER_VIDEO && !output->received_video[packet->track_idx] && !packet->keyframe) {
@@ -2296,6 +2298,8 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	if (packet_time) {
 		output_packet_time = da_push_back_new(output->encoder_packet_times[packet->track_idx]);
 		*output_packet_time = *packet_time;
+		output_packet_time->interleaved_mutex_wait_start_monotonic_ns = interleaved_mutex_wait_start;
+		output_packet_time->interleaved_mutex_acquired_monotonic_ns = interleaved_mutex_acquired;
 	}
 
 	if (was_started)
