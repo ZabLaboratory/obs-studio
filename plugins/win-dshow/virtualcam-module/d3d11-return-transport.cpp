@@ -197,6 +197,7 @@ struct pulsar_d3d11_return_producer {
 	ComPtr<IDXGIKeyedMutex> mutexes[PULSAR_D3D11_RETURN_SLOT_COUNT];
 	HANDLE source_handles[PULSAR_D3D11_RETURN_SLOT_COUNT] = {};
 	uint32_t consumer_pid = 0;
+	HANDLE consumer_process = nullptr;
 	uint64_t epoch = 1;
 	uint64_t sequence = 0;
 	uint32_t width = 0;
@@ -280,6 +281,10 @@ static void producer_release_ring(pulsar_d3d11_return_producer *producer)
 		texture.Reset();
 	for (auto &mutex : producer->mutexes)
 		mutex.Reset();
+	if (producer->consumer_process) {
+		CloseHandle(producer->consumer_process);
+		producer->consumer_process = nullptr;
+	}
 	producer->device.Reset();
 	producer->context.Reset();
 	producer->consumer_pid = 0;
@@ -306,14 +311,30 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 	const uint32_t pid = producer->control->consumer_pid;
 	if (!pid)
 		return false;
+	if (producer->consumer_pid == pid && producer->consumer_process &&
+		WaitForSingleObject(producer->consumer_process, 0) != WAIT_TIMEOUT) {
+		/* The consumer disappeared (or the liveness query failed). Do not
+		 * keep publishing into a stale ring or attempt a hot rebind. */
+		InterlockedExchange((volatile LONG *)&producer->control->consumer_ready, 0);
+		producer_release_ring(producer);
+		return false;
+	}
 	if (producer->consumer_pid == pid && producer->control->selected_path == PULSAR_D3D11_PATH_SHARED_TEXTURE &&
-		producer->control->consumer_ready)
+		producer->control->consumer_ready && producer->consumer_process)
 		return true;
 	if (producer->consumer_pid == pid && producer->control->selected_path == PULSAR_D3D11_PATH_SHARED_TEXTURE)
 		return false;
 	if (producer->consumer_pid == pid && producer->control->fallback_reason != PULSAR_D3D11_FALLBACK_NONE)
 		return false;
 	producer_release_ring(producer);
+	HANDLE consumer_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+	if (!consumer_process || WaitForSingleObject(consumer_process, 0) != WAIT_TIMEOUT) {
+		if (consumer_process)
+			CloseHandle(consumer_process);
+		set_fallback(producer->control, PULSAR_D3D11_FALLBACK_INTEROP, E_HANDLE);
+		return false;
+	}
+	producer->consumer_process = consumer_process;
 	ComPtr<ID3D11Device> device;
 	ComPtr<ID3D11DeviceContext> context;
 	pulsar_d3d11_return_luid luid = {};
