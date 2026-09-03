@@ -87,6 +87,11 @@ video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_t inter
 	if (!vq.handle) {
 		return NULL;
 	}
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		CloseHandle(vq.handle);
+		vq.handle = NULL;
+		return NULL;
+	}
 
 	vq.header = (struct queue_header *)MapViewOfFile(vq.handle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
 	if (!vq.header) {
