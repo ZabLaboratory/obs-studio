@@ -188,8 +188,11 @@ HRESULT VCamFilter::AcquireConsumerLease()
 		return S_OK;
 
 	consumer_lease = CreateEventW(nullptr, TRUE, FALSE, consumer_lease_name.c_str());
-	if (!consumer_lease.Valid()) {
-		const DWORD error = GetLastError();
+	const DWORD lease_error = GetLastError();
+	if (!consumer_lease.Valid() || lease_error == ERROR_ALREADY_EXISTS) {
+		if (consumer_lease.Valid())
+			consumer_lease = nullptr;
+		const DWORD error = lease_error;
 		OutputDebugStringW(L"[pulsar-directshow] failed to acquire return consumer lease\n");
 		return HRESULT_FROM_WIN32(error ? error : ERROR_OPEN_FAILED);
 	}
