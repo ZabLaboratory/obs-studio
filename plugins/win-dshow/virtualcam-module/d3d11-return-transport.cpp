@@ -290,6 +290,20 @@ static void producer_release_ring(pulsar_d3d11_return_producer *producer)
 	producer->consumer_pid = 0;
 }
 
+static bool producer_invalidate_consumer_registration(pulsar_d3d11_return_producer *producer, uint32_t pid)
+{
+	if (!producer || !producer->control)
+		return false;
+	const bool invalidated =
+		InterlockedCompareExchange((volatile LONG *)&producer->control->consumer_pid, 0, (LONG)pid) == (LONG)pid;
+	if (invalidated) {
+		InterlockedExchange((volatile LONG *)&producer->control->consumer_ready, 0);
+		InterlockedExchange((volatile LONG *)&producer->control->consumer_session, 0);
+	}
+	producer_release_ring(producer);
+	return invalidated;
+}
+
 extern "C" void pulsar_d3d11_return_producer_close(pulsar_d3d11_return_producer_t *producer)
 {
 	if (!producer)
@@ -311,25 +325,28 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 	const uint32_t pid = producer->control->consumer_pid;
 	if (!pid)
 		return false;
-	const uint32_t consumer_session = process_session(pid);
-	if (consumer_session == UINT32_MAX || producer->control->consumer_session != consumer_session) {
-		/* A recycled PID from another Windows session is not the consumer that
-		 * published this control block.  Reject it before duplicating handles. */
-		set_fallback(producer->control, PULSAR_D3D11_FALLBACK_INTEROP, E_ACCESSDENIED);
-		return false;
-	}
 	if (producer->consumer_pid == pid && producer->consumer_process &&
 		WaitForSingleObject(producer->consumer_process, 0) != WAIT_TIMEOUT) {
 		/* The consumer disappeared (or the liveness query failed). Do not
 		 * keep publishing into a stale ring or attempt a hot rebind. */
-		InterlockedExchange((volatile LONG *)&producer->control->consumer_ready, 0);
 		/* Invalidate the published registration as well. A later consumer must
 		 * explicitly register again; a recycled PID must never inherit the old
 		 * D3D11 sink. */
-		if (InterlockedCompareExchange((volatile LONG *)&producer->control->consumer_pid, 0, (LONG)pid) ==
-		    (LONG)pid)
-			InterlockedExchange((volatile LONG *)&producer->control->consumer_session, 0);
-		producer_release_ring(producer);
+		producer_invalidate_consumer_registration(producer, pid);
+		return false;
+	}
+	const uint32_t consumer_session = process_session(pid);
+	if (consumer_session == UINT32_MAX) {
+		/* A dead or inaccessible PID cannot prove ownership. Clear the stale
+		 * registration even when no liveness handle was retained. */
+		if (producer_invalidate_consumer_registration(producer, pid))
+			set_fallback(producer->control, PULSAR_D3D11_FALLBACK_INTEROP, E_HANDLE);
+		return false;
+	}
+	if (producer->control->consumer_session != consumer_session) {
+		/* A recycled PID from another Windows session is not the consumer that
+		 * published this control block.  Reject it before duplicating handles. */
+		set_fallback(producer->control, PULSAR_D3D11_FALLBACK_INTEROP, E_ACCESSDENIED);
 		return false;
 	}
 	if (producer->consumer_pid == pid && producer->control->selected_path == PULSAR_D3D11_PATH_SHARED_TEXTURE &&
