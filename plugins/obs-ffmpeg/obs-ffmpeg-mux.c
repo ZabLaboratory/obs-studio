@@ -1200,6 +1200,17 @@ static void deactivate_replay_buffer(struct ffmpeg_muxer *stream, int code)
 	replay_buffer_clear(stream);
 }
 
+static void replay_buffer_stop(void *data, uint64_t ts)
+{
+	struct ffmpeg_muxer *stream = data;
+	(void)ts;
+	if (capturing(stream) || active(stream)) {
+		stream->stop_ts = 0;
+		os_atomic_set_bool(&stream->stopping, true);
+		os_atomic_set_bool(&stream->capturing, false);
+	}
+}
+
 static void replay_buffer_data(void *data, struct encoder_packet *packet)
 {
 	struct ffmpeg_muxer *stream = data;
@@ -1215,10 +1226,8 @@ static void replay_buffer_data(void *data, struct encoder_packet *packet)
 	}
 
 	if (stopping(stream)) {
-		if (packet->sys_dts_usec >= stream->stop_ts) {
-			deactivate_replay_buffer(stream, 0);
-			return;
-		}
+		deactivate_replay_buffer(stream, 0);
+		return;
 	}
 
 	obs_encoder_packet_ref(&pkt, packet);
@@ -1263,7 +1272,7 @@ struct obs_output_info replay_buffer = {
 	.create = replay_buffer_create,
 	.destroy = replay_buffer_destroy,
 	.start = replay_buffer_start,
-	.stop = ffmpeg_mux_stop,
+	.stop = replay_buffer_stop,
 	.encoded_packet = replay_buffer_data,
 	.get_total_bytes = ffmpeg_mux_total_bytes,
 	.get_defaults = replay_buffer_defaults,
