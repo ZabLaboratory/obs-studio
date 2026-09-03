@@ -67,6 +67,7 @@ class VCamFilter : public DShow::OutputFilter {
 	pulsar_d3d11_return_consumer_t *d3d11 = nullptr;
 	bool d3d11_requested = false;
 	WinHandle consumer_lease;
+	HANDLE consumer_registration_pipe = INVALID_HANDLE_VALUE;
 	int queue_mode = 0;
 	bool in_obs = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
@@ -97,6 +98,8 @@ class VCamFilter : public DShow::OutputFilter {
 					      const struct directshow_stage_timing &timing);
 	HRESULT AcquireConsumerLease();
 	void ReleaseConsumerLease();
+	bool OpenConsumerRegistrationPipe();
+	void ReleaseConsumerRegistrationPipe();
 	void UpdatePlaceholder(void);
 	const int GetOutputBufferSize(void);
 

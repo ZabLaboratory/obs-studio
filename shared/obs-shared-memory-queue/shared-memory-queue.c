@@ -29,7 +29,11 @@ struct queue_header {
 	 * reserved words, so the 80-byte header ABI is unchanged. */
 	uint32_t frame_header_size;
 	uint32_t frame_metadata_version;
-	uint32_t reserved[6];
+	/* Producer-issued registration challenge; the reader mapping remains
+	 * FILE_MAP_READ and the 80-byte header ABI is unchanged. */
+	uint32_t consumer_challenge_low;
+	uint32_t consumer_challenge_high;
+	uint32_t reserved[4];
 };
 
 struct video_queue_slot_header {
@@ -313,6 +317,15 @@ video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_t inter
 	header.interval = interval;
 	header.frame_header_size = metadata_enabled ? FRAME_HEADER_SIZE : 0;
 	header.frame_metadata_version = metadata_enabled ? VIDEO_QUEUE_METADATA_VERSION : 0;
+	LARGE_INTEGER challenge_counter = {};
+	QueryPerformanceCounter(&challenge_counter);
+	uint64_t challenge = (uint64_t)challenge_counter.QuadPart ^ ((uint64_t)GetCurrentProcessId() << 32);
+	if (!challenge)
+		challenge = 1;
+	else if (!(uint32_t)challenge)
+		challenge |= 1;
+	header.consumer_challenge_low = (uint32_t)challenge;
+	header.consumer_challenge_high = (uint32_t)(challenge >> 32);
 	vq.is_writer = true;
 
 	for (size_t i = 0; i < 3; i++) {
@@ -411,6 +424,18 @@ open_failed:
 	CloseHandle(vq.handle);
 	free(vq.read_buffer);
 	return NULL;
+}
+
+bool video_queue_get_challenge(video_queue_t *vq, uint64_t *challenge)
+{
+	if (!queue_mapping_live(vq) || !vq->metadata_enabled || !challenge)
+		return false;
+	const uint64_t value = ((uint64_t)vq->header->consumer_challenge_high << 32) |
+		(uint32_t)vq->header->consumer_challenge_low;
+	if (!value || !(uint32_t)value)
+		return false;
+	*challenge = value;
+	return true;
 }
 
 video_queue_t *video_queue_create(uint32_t cx, uint32_t cy, uint64_t interval)

@@ -72,6 +72,7 @@ extern video_queue_t *video_queue_create_named(uint32_t cx, uint32_t cy, uint64_
 									 const wchar_t *name);
 extern video_queue_t *video_queue_open_named(const wchar_t *name);
 extern void video_queue_close(video_queue_t *vq);
+extern bool video_queue_get_challenge(video_queue_t *vq, uint64_t *challenge);
 
 extern void video_queue_get_info(video_queue_t *vq, uint32_t *cx, uint32_t *cy, uint64_t *interval);
 extern void video_queue_write(video_queue_t *vq, uint8_t **data, uint32_t *linesize, uint64_t timestamp);

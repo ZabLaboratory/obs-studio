@@ -1,4 +1,5 @@
 #include <obs-module.h>
+#include <windows.h>
 #include <util/platform.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,6 +27,8 @@ struct virtualcam_data {
 	video_queue_t *vq;
 	wchar_t queue_name[256];
 	wchar_t consumer_lease_name[288];
+	wchar_t consumer_registration_pipe_name[256];
+	HANDLE consumer_registration_pipe;
 	bool queue_namespace_rejected;
 	bool program_return;
 	bool preview_return;
@@ -84,14 +87,96 @@ static void return_lease_log_state(struct virtualcam_data *vcam, enum return_lea
 		     return_lease_state_name(state), vcam->consumer_lease_name);
 }
 
+static void return_consumer_registration_pipe_close(struct virtualcam_data *vcam)
+{
+	if (vcam->consumer_registration_pipe && vcam->consumer_registration_pipe != INVALID_HANDLE_VALUE) {
+		DisconnectNamedPipe(vcam->consumer_registration_pipe);
+		CloseHandle(vcam->consumer_registration_pipe);
+		vcam->consumer_registration_pipe = INVALID_HANDLE_VALUE;
+	}
+}
+
+static bool return_consumer_registration_pipe_start(struct virtualcam_data *vcam)
+{
+	uint64_t challenge = 0;
+	if (!video_queue_get_challenge(vcam->vq, &challenge))
+		return false;
+	_snwprintf_s(vcam->consumer_registration_pipe_name,
+			     sizeof(vcam->consumer_registration_pipe_name) /
+				     sizeof(vcam->consumer_registration_pipe_name[0]),
+			     _TRUNCATE, L"\\\\.\\pipe\\PulsarReturn.%hs.%016llx",
+			     return_lease_role(vcam), (unsigned long long)challenge);
+	vcam->consumer_registration_pipe = CreateNamedPipeW(
+		vcam->consumer_registration_pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT, 1, 0, 0, 0, NULL);
+	return vcam->consumer_registration_pipe != INVALID_HANDLE_VALUE;
+}
+
+static bool return_consumer_process_image_allowed(HANDLE process)
+{
+	wchar_t image_path[MAX_PATH] = {0};
+	DWORD image_path_size = (DWORD)(sizeof(image_path) / sizeof(image_path[0]));
+	if (!QueryFullProcessImageNameW(process, 0, image_path, &image_path_size))
+		return false;
+	const wchar_t *image_name = wcsrchr(image_path, L'\\');
+	image_name = image_name ? image_name + 1 : image_path;
+	return _wcsicmp(image_name, L"obs64.exe") == 0 || _wcsicmp(image_name, L"obs32.exe") == 0 ||
+	       _wcsicmp(image_name, L"ffmpeg.exe") == 0 || _wcsicmp(image_name, L"pulsar.exe") == 0 ||
+	       _wcsicmp(image_name, L"electron.exe") == 0 || _wcsicmp(image_name, L"prism.exe") == 0;
+}
+
+static bool return_consumer_registration_live(struct virtualcam_data *vcam)
+{
+	if (!vcam->consumer_registration_pipe || vcam->consumer_registration_pipe == INVALID_HANDLE_VALUE)
+		return false;
+	BOOL connected = ConnectNamedPipe(vcam->consumer_registration_pipe, NULL);
+	if (!connected) {
+		const DWORD error = GetLastError();
+		/* PIPE_NOWAIT deliberately keeps the lease watcher off the video
+		 * callback.  ERROR_PIPE_LISTENING is the normal, healthy state while
+		 * the DirectShow graph is still inside CreateFileW; do not close and
+		 * recreate the server here or the client can be stranded between
+		 * attempts.  A later poll will observe ERROR_PIPE_CONNECTED once the
+		 * kernel completes the rendezvous. */
+		if (error == ERROR_PIPE_LISTENING)
+			return false;
+		if (error != ERROR_PIPE_CONNECTED) {
+			return_consumer_registration_pipe_close(vcam);
+			(void)return_consumer_registration_pipe_start(vcam);
+			return false;
+		}
+	}
+	ULONG pid = 0;
+	if (!GetNamedPipeClientProcessId(vcam->consumer_registration_pipe, &pid) || !pid) {
+		return_consumer_registration_pipe_close(vcam);
+		(void)return_consumer_registration_pipe_start(vcam);
+		return false;
+	}
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+	DWORD observed_session = 0;
+	DWORD producer_session = 0;
+	const bool live = process && ProcessIdToSessionId(pid, &observed_session) &&
+			  ProcessIdToSessionId(GetCurrentProcessId(), &producer_session) && observed_session == producer_session &&
+			  WaitForSingleObject(process, 0) == WAIT_TIMEOUT && return_consumer_process_image_allowed(process);
+	if (process)
+		CloseHandle(process);
+	if (live)
+		return true;
+	return_consumer_registration_pipe_close(vcam);
+	(void)return_consumer_registration_pipe_start(vcam);
+	return false;
+}
+
 static bool return_lease_probe_once(struct virtualcam_data *vcam)
 {
 	InterlockedIncrement(&vcam->lease_polls);
 	HANDLE lease = OpenEventW(SYNCHRONIZE, FALSE, vcam->consumer_lease_name);
-	const bool active = lease != NULL;
-	const DWORD probe_error = active ? ERROR_SUCCESS : GetLastError();
+	const bool lease_present = lease != NULL;
+	const DWORD probe_error = lease_present ? ERROR_SUCCESS : GetLastError();
 	if (lease)
 		CloseHandle(lease);
+	const bool registration_live = return_consumer_registration_live(vcam);
+	const bool active = lease_present && registration_live;
 
 	if (active) {
 		InterlockedIncrement(&vcam->lease_hits);
@@ -328,6 +413,7 @@ static void virtualcam_destroy(void *data)
 {
 	struct virtualcam_data *vcam = (struct virtualcam_data *)data;
 	return_lease_watcher_stop(vcam);
+	return_consumer_registration_pipe_close(vcam);
 	pulsar_d3d11_return_producer_close(vcam->d3d11);
 	video_queue_close(vcam->vq);
 	bfree(data);
@@ -342,6 +428,7 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 	vcam->preview_return = obs_output_get_id(output) &&
 				       strcmp(obs_output_get_id(output), "preview_return_output") == 0;
 	vcam->consumer_gated = vcam->program_return || vcam->preview_return;
+	vcam->consumer_registration_pipe = INVALID_HANDLE_VALUE;
 	vcam->lease_telemetry_enabled = return_lease_telemetry_enabled();
 	const char *transport = getenv("PULSAR_RETURN_TRANSPORT");
 	vcam->d3d11_requested = vcam->consumer_gated && transport && strcmp(transport, "d3d11") == 0;
@@ -387,6 +474,13 @@ static bool virtualcam_start(void *data)
 		     vcam->queue_name, runtime_id ? runtime_id : "");
 		return false;
 	}
+	if (vcam->consumer_gated && !return_consumer_registration_pipe_start(vcam)) {
+		video_queue_close(vcam->vq);
+		vcam->vq = NULL;
+		blog(LOG_WARNING, "[pulsar-directshow] %s registration channel unavailable; output remains stopped",
+		     return_lease_role(vcam));
+		return false;
+	}
 
 	struct video_scale_info vsi = {0};
 	vsi.format = VIDEO_FORMAT_NV12;
@@ -417,6 +511,7 @@ static void virtualcam_deactive(struct virtualcam_data *vcam)
 {
 	os_atomic_set_bool(&vcam->active, false);
 	obs_output_end_data_capture(vcam->output);
+	return_consumer_registration_pipe_close(vcam);
 	pulsar_d3d11_return_producer_close(vcam->d3d11);
 	vcam->d3d11 = NULL;
 	video_queue_close(vcam->vq);

@@ -171,6 +171,7 @@ VCamFilter::~VCamFilter()
 	SetEvent(thread_stop);
 	if (th.joinable())
 		th.join();
+	ReleaseConsumerRegistrationPipe();
 	if (d3d11_requested && d3d11)
 		pulsar_d3d11_return_consumer_close(d3d11);
 	d3d11 = nullptr;
@@ -202,6 +203,29 @@ HRESULT VCamFilter::AcquireConsumerLease()
 void VCamFilter::ReleaseConsumerLease()
 {
 	consumer_lease = nullptr;
+}
+
+bool VCamFilter::OpenConsumerRegistrationPipe()
+{
+	if (!consumer_gated || !vq || consumer_registration_pipe != INVALID_HANDLE_VALUE)
+		return consumer_registration_pipe != INVALID_HANDLE_VALUE;
+	uint64_t challenge = 0;
+	if (!video_queue_get_challenge(vq, &challenge))
+		return false;
+	wchar_t pipe_name[256] = {0};
+	const wchar_t *role = preview_return ? L"PreviewReturn" : L"ProgramReturn";
+	_snwprintf_s(pipe_name, sizeof(pipe_name) / sizeof(pipe_name[0]), _TRUNCATE,
+			     L"\\\\.\\pipe\\PulsarReturn.%ls.%016llx", role, (unsigned long long)challenge);
+	consumer_registration_pipe = CreateFileW(pipe_name, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+	return consumer_registration_pipe != INVALID_HANDLE_VALUE;
+}
+
+void VCamFilter::ReleaseConsumerRegistrationPipe()
+{
+	if (consumer_registration_pipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(consumer_registration_pipe);
+		consumer_registration_pipe = INVALID_HANDLE_VALUE;
+	}
 }
 
 const wchar_t *VCamFilter::FilterName() const
@@ -239,6 +263,7 @@ STDMETHODIMP VCamFilter::Stop()
 {
 	os_atomic_set_bool(&active, false);
 	ReleaseConsumerLease();
+	ReleaseConsumerRegistrationPipe();
 	return OutputFilter::Stop();
 }
 
@@ -321,6 +346,8 @@ void VCamFilter::Frame(uint64_t ts)
 	if (!vq) {
 		vq = video_queue_open_named(queue_name.c_str());
 	}
+	if (consumer_gated && vq)
+		OpenConsumerRegistrationPipe();
 
 	enum queue_state state = video_queue_state(vq);
 	if (state != prev_state) {
@@ -329,6 +356,7 @@ void VCamFilter::Frame(uint64_t ts)
 			   the actual cx / cy of the data stream */
 			video_queue_get_info(vq, &new_obs_cx, &new_obs_cy, &new_obs_interval);
 		} else if (state == SHARED_QUEUE_STATE_STOPPING) {
+			ReleaseConsumerRegistrationPipe();
 			video_queue_close(vq);
 			vq = nullptr;
 		}
