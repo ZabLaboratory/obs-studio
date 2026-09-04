@@ -79,6 +79,7 @@ target_sources(
   obs-virtualcam-module
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/virtualcam-module.rc
+    d3d11-return-auth.h
     d3d11-return-transport.cpp
     d3d11-return-transport.hpp
     placeholder.cpp
@@ -106,6 +107,39 @@ target_link_libraries(
     winmm
     d3d11
     dxgi
+    bcrypt
+    advapi32
+)
+
+add_executable(
+  pulsar-d3d11-return-helper
+  d3d11-return-auth.c
+  d3d11-return-auth.h
+  d3d11-return-transport.cpp
+  d3d11-return-transport.hpp
+  pulsar-d3d11-return-helper.cpp
+)
+
+target_link_libraries(
+  pulsar-d3d11-return-helper
+  PRIVATE
+    OBS::shared-memory-queue
+    d3d11
+    dxgi
+    bcrypt
+    advapi32
+)
+
+if(CMAKE_VS_PLATFORM_NAME STREQUAL x64)
+  set(_HELPER_OUTPUT_NAME pulsar-d3d11-return-helper64)
+else()
+  set(_HELPER_OUTPUT_NAME pulsar-d3d11-return-helper32)
+endif()
+set_target_properties_obs(
+  pulsar-d3d11-return-helper PROPERTIES
+  FOLDER plugins/win-dshow
+  OUTPUT_NAME ${_HELPER_OUTPUT_NAME}
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
 
 if(OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)

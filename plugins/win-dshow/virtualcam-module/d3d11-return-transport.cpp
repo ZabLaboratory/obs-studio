@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
+#include <sddl.h>
 #include <windows.h>
 #include <wrl/client.h>
 
@@ -202,6 +203,39 @@ static HRESULT duplicate_handle_for_pid(HANDLE source, DWORD pid, uint64_t *valu
 	return S_OK;
 }
 
+static HRESULT duplicate_handle_for_process(HANDLE source, HANDLE target_process, uint64_t *value)
+{
+	if (!source || !target_process || !value)
+		return E_INVALIDARG;
+	HANDLE duplicated = nullptr;
+	const BOOL ok = DuplicateHandle(GetCurrentProcess(), source, target_process, &duplicated, 0, FALSE,
+					DUPLICATE_SAME_ACCESS);
+	const DWORD error = GetLastError();
+	if (!ok)
+		return HRESULT_FROM_WIN32(error ? error : ERROR_INVALID_HANDLE);
+	*value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(duplicated));
+	return S_OK;
+}
+
+static HANDLE create_owner_only_mapping(const std::wstring &name, DWORD size, bool *existed)
+{
+	if (existed)
+		*existed = false;
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;OW)", SDDL_REVISION_1,
+								  &descriptor, nullptr))
+		return nullptr;
+	SECURITY_ATTRIBUTES attributes = {};
+	attributes.nLength = sizeof(attributes);
+	attributes.lpSecurityDescriptor = descriptor;
+	HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &attributes, PAGE_READWRITE, 0, size, name.c_str());
+	const DWORD error = GetLastError();
+	LocalFree(descriptor);
+	if (existed)
+		*existed = error == ERROR_ALREADY_EXISTS;
+	return mapping;
+}
+
 } // namespace
 
 struct pulsar_d3d11_return_producer {
@@ -214,6 +248,7 @@ struct pulsar_d3d11_return_producer {
 	HANDLE source_handles[PULSAR_D3D11_RETURN_SLOT_COUNT] = {};
 	uint32_t consumer_pid = 0;
 	HANDLE consumer_process = nullptr;
+	HANDLE helper_process = nullptr;
 	volatile LONG authenticated_consumer_pid = 0;
 	volatile LONG authenticated_consumer_session = 0;
 	uint64_t epoch = 1;
@@ -238,6 +273,8 @@ struct pulsar_d3d11_return_consumer {
 	uint64_t consumed_sequence = 0;
 };
 
+static void producer_release_ring(pulsar_d3d11_return_producer *producer);
+
 extern "C" pulsar_d3d11_return_producer_t *pulsar_d3d11_return_producer_create(
 	const wchar_t *name, enum pulsar_d3d11_return_lane lane, uint32_t width, uint32_t height)
 {
@@ -249,9 +286,8 @@ extern "C" pulsar_d3d11_return_producer_t *pulsar_d3d11_return_producer_create(
 	auto *producer = new pulsar_d3d11_return_producer();
 	producer->width = width;
 	producer->height = height;
-	producer->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-							 static_cast<DWORD>(sizeof(pulsar_d3d11_return_control)), map_name.c_str());
-	const bool existed = GetLastError() == ERROR_ALREADY_EXISTS;
+	bool existed = false;
+	producer->mapping = create_owner_only_mapping(map_name, static_cast<DWORD>(sizeof(pulsar_d3d11_return_control)), &existed);
 	if (!producer->mapping) {
 		delete producer;
 		return nullptr;
@@ -288,6 +324,12 @@ extern "C" pulsar_d3d11_return_producer_t *pulsar_d3d11_return_producer_create(
 extern "C" bool pulsar_d3d11_return_producer_set_consumer_pid(
 	pulsar_d3d11_return_producer_t *producer, uint32_t pid)
 {
+	/* A private helper is authenticated on its inherited channel.  Never let
+	 * the public DirectShow registration overwrite that binding. */
+	if (producer && producer->helper_process) {
+		const DWORD helper_pid = GetProcessId(producer->helper_process);
+		return pid && helper_pid == pid;
+	}
 	if (!producer || !producer->control || !pid) {
 		if (producer) {
 			InterlockedExchange(&producer->authenticated_consumer_pid, 0);
@@ -320,6 +362,34 @@ extern "C" bool pulsar_d3d11_return_producer_set_consumer_pid(
 	 * PID paired with the previous registration's session. */
 	InterlockedExchange(&producer->authenticated_consumer_session, static_cast<LONG>(session));
 	InterlockedExchange(&producer->authenticated_consumer_pid, static_cast<LONG>(pid));
+	return true;
+}
+
+extern "C" bool pulsar_d3d11_return_producer_bind_helper(
+	pulsar_d3d11_return_producer_t *producer, HANDLE helper_process)
+{
+	if (!producer || !producer->control || !helper_process)
+		return false;
+	const DWORD pid = GetProcessId(helper_process);
+	const uint32_t session = process_session(pid);
+	if (!pid || session == UINT32_MAX || WaitForSingleObject(helper_process, 0) != WAIT_TIMEOUT)
+		return false;
+	HANDLE duplicate = nullptr;
+	if (!DuplicateHandle(GetCurrentProcess(), helper_process, GetCurrentProcess(), &duplicate, 0, FALSE,
+				     DUPLICATE_SAME_ACCESS))
+		return false;
+	producer_release_ring(producer);
+	if (producer->helper_process)
+		CloseHandle(producer->helper_process);
+	producer->helper_process = duplicate;
+	InterlockedExchange(&producer->authenticated_consumer_pid, 0);
+	InterlockedExchange(&producer->authenticated_consumer_session, 0);
+	InterlockedExchange((volatile LONG *)&producer->control->consumer_ready, 0);
+	InterlockedExchange((volatile LONG *)&producer->control->consumer_pid, 0);
+	InterlockedExchange((volatile LONG *)&producer->control->consumer_session, 0);
+	producer->control->selected_path = PULSAR_D3D11_PATH_CPU;
+	producer->control->fallback_reason = PULSAR_D3D11_FALLBACK_CAPABILITY;
+	producer->control->fallback_hresult = static_cast<int32_t>(E_PENDING);
 	return true;
 }
 
@@ -371,6 +441,8 @@ extern "C" void pulsar_d3d11_return_producer_close(pulsar_d3d11_return_producer_
 		UnmapViewOfFile(producer->control);
 	if (producer->mapping)
 		CloseHandle(producer->mapping);
+	if (producer->helper_process)
+		CloseHandle(producer->helper_process);
 	delete producer;
 }
 
@@ -378,8 +450,11 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 {
 	if (!producer || !producer->control)
 		return false;
-	const uint32_t pid = load_u32((volatile uint32_t *)&producer->authenticated_consumer_pid);
-	const uint32_t authenticated_session = load_u32((volatile uint32_t *)&producer->authenticated_consumer_session);
+	const bool helper_bound = producer->helper_process != nullptr;
+	const uint32_t pid = helper_bound ? GetProcessId(producer->helper_process)
+					 : load_u32((volatile uint32_t *)&producer->authenticated_consumer_pid);
+	const uint32_t authenticated_session = helper_bound ? process_session(pid)
+							 : load_u32((volatile uint32_t *)&producer->authenticated_consumer_session);
 	if (!pid || authenticated_session == UINT32_MAX) {
 		if (producer->consumer_pid)
 			producer_invalidate_consumer_registration(producer, producer->consumer_pid);
@@ -416,7 +491,11 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 	if (producer->consumer_pid == pid && producer->control->fallback_reason != PULSAR_D3D11_FALLBACK_NONE)
 		return false;
 	producer_release_ring(producer);
-	HANDLE consumer_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+	HANDLE consumer_process = helper_bound ? nullptr
+							 : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+	if (helper_bound && !DuplicateHandle(GetCurrentProcess(), producer->helper_process, GetCurrentProcess(),
+						&consumer_process, 0, FALSE, DUPLICATE_SAME_ACCESS))
+		consumer_process = nullptr;
 	if (!consumer_process || WaitForSingleObject(consumer_process, 0) != WAIT_TIMEOUT) {
 		if (consumer_process)
 			CloseHandle(consumer_process);
@@ -445,7 +524,8 @@ static bool producer_prepare_ring(pulsar_d3d11_return_producer *producer)
 		if (FAILED(hr))
 			break;
 		uint64_t duplicated = 0;
-		hr = duplicate_handle_for_pid(handle, pid, &duplicated);
+		hr = helper_bound ? duplicate_handle_for_process(handle, producer->helper_process, &duplicated)
+					 : duplicate_handle_for_pid(handle, pid, &duplicated);
 		if (FAILED(hr)) {
 			texture->Release();
 			CloseHandle(handle);
@@ -661,8 +741,14 @@ extern "C" bool pulsar_d3d11_return_consumer_read(pulsar_d3d11_return_consumer_t
 {
 	if (!d3d11_transport_requested() || !consumer || !dst || !consumer->control)
 		return false;
-	if (!consumer->active && !consumer_open_ring(consumer))
-		return false;
+	if (!consumer->active) {
+		/* The helper may open the producer mapping before the first frame.  Do
+		 * not treat the initial CPU/fallback state as a terminal failure; wait
+		 * for the producer-authoritative ring publication and only then open
+		 * the duplicated handles. */
+		if (consumer->control->selected_path != PULSAR_D3D11_PATH_SHARED_TEXTURE || !consumer_open_ring(consumer))
+			return false;
+	}
 	if (consumer->control->selected_path != PULSAR_D3D11_PATH_SHARED_TEXTURE)
 		return false;
 	const uint64_t published = load_u64((volatile uint64_t *)&consumer->control->published_sequence);

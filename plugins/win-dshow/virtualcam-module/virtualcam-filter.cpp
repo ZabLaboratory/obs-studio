@@ -59,8 +59,10 @@ VCamFilter::VCamFilter(enum directshow_consumer_filter_kind filter_kind)
 	program_return = filter_kind == DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN;
 	preview_return = filter_kind == DIRECTSHOW_CONSUMER_FILTER_PREVIEW_RETURN;
 	consumer_gated = program_return || preview_return;
-	const char *return_transport = getenv("PULSAR_RETURN_TRANSPORT");
-	d3d11_requested = consumer_gated && return_transport && strcmp(return_transport, "d3d11") == 0;
+	/* DirectShow is never a D3D11 capability holder.  The producer-launched
+	 * private helper performs the authenticated readback and relays an NV12
+	 * frame into this read-only queue. */
+	d3d11_requested = false;
 	const enum directshow_queue_namespace queue_namespace = directshow_queue_namespace_for_consumer(filter_kind);
 	queue_namespace_rejected = queue_namespace == DIRECTSHOW_QUEUE_NAMESPACE_REJECT;
 	queue_name = queue_name_for_filter(queue_namespace, filter_kind);
@@ -172,8 +174,6 @@ VCamFilter::~VCamFilter()
 	if (th.joinable())
 		th.join();
 	ReleaseConsumerRegistrationPipe();
-	if (d3d11_requested && d3d11)
-		pulsar_d3d11_return_consumer_close(d3d11);
 	d3d11 = nullptr;
 	video_queue_close(vq);
 
@@ -432,48 +432,16 @@ void VCamFilter::Frame(uint64_t ts)
 	struct directshow_stage_timing timing = {};
 	timing.frame_entry_monotonic_ns = frame_entry_monotonic_ns;
 	bool consumed_program_frame = false;
-	bool consumed_d3d11_frame = false;
-	if (d3d11_requested && current_format == VideoFormat::NV12 && obs_cx == PULSAR_D3D11_RETURN_WIDTH &&
-	    obs_cy == PULSAR_D3D11_RETURN_HEIGHT) {
-		if (!d3d11) {
-			const enum pulsar_d3d11_return_lane lane = program_return ? PULSAR_D3D11_PROGRAM_RETURN
-										 : PULSAR_D3D11_PREVIEW_RETURN;
-			d3d11 = pulsar_d3d11_return_consumer_open(queue_name.c_str(), lane, obs_cx, obs_cy);
-		}
-	}
 	if (LockSampleData(&ptr)) {
 		timing.lock_sample_data_acquired_monotonic_ns = trace_monotonic_ns();
-		if (state == SHARED_QUEUE_STATE_READY || (d3d11_requested && d3d11))
+		if (state == SHARED_QUEUE_STATE_READY)
 			timing.queue_read_start_monotonic_ns = trace_monotonic_ns();
-		if (d3d11_requested && d3d11)
-			consumed_d3d11_frame = pulsar_d3d11_return_consumer_read(d3d11, ptr, nullptr, &metadata);
-		if (!consumed_d3d11_frame && state == SHARED_QUEUE_STATE_READY)
+		if (state == SHARED_QUEUE_STATE_READY)
 			consumed_program_frame = ShowOBSFrame(ptr, &metadata, &timing.queue_counters);
-		if (state == SHARED_QUEUE_STATE_READY || (d3d11_requested && d3d11))
+		if (state == SHARED_QUEUE_STATE_READY)
 			timing.queue_read_completed_monotonic_ns = trace_monotonic_ns();
-		if ((!consumed_program_frame && !consumed_d3d11_frame) ||
-		    (state != SHARED_QUEUE_STATE_READY && !consumed_d3d11_frame))
+		if (!consumed_program_frame)
 			ShowDefaultFrame(ptr);
-		if (d3d11_requested && d3d11) {
-			consumed_program_frame = consumed_program_frame || consumed_d3d11_frame;
-			const struct pulsar_d3d11_return_control *control =
-				pulsar_d3d11_return_consumer_control(d3d11);
-			if (control) {
-				timing.transport_path = control->selected_path;
-				timing.transport_fallback = control->fallback_reason;
-				timing.transport_hresult = control->fallback_hresult;
-				timing.transport_lane = control->lane;
-				timing.transport_epoch = control->epoch;
-				timing.transport_produced_sequence = control->produced_sequence;
-				timing.transport_published_sequence = control->published_sequence;
-				timing.transport_consumed_sequence = control->consumed_sequence;
-				timing.transport_mutex_wait_ns = control->mutex_wait_ns;
-				timing.transport_fence_wait_ns = control->fence_wait_ns;
-				timing.transport_gpu_copy_ns = control->gpu_copy_ns;
-				timing.transport_readback_ns = control->readback_ns;
-				timing.transport_frame_age_ns = control->frame_age_ns;
-			}
-		}
 
 		UnlockSampleData(ts, ts + obs_interval);
 		timing.unlock_sample_data_completed_monotonic_ns = trace_monotonic_ns();

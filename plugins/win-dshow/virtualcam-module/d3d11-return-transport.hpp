@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <wchar.h>
+#include <windows.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,6 +108,11 @@ pulsar_d3d11_return_producer_t *pulsar_d3d11_return_producer_create(
 	const wchar_t *control_name, enum pulsar_d3d11_return_lane lane, uint32_t width, uint32_t height);
 void pulsar_d3d11_return_producer_close(pulsar_d3d11_return_producer_t *producer);
 bool pulsar_d3d11_return_producer_set_consumer_pid(pulsar_d3d11_return_producer_t *producer, uint32_t pid);
+/* Bind the D3D11 sink to a producer-owned helper process.  The caller must
+ * complete the private capability handshake before invoking this function;
+ * no PID obtained from a public mapping or DirectShow registration is accepted
+ * as the helper binding. */
+bool pulsar_d3d11_return_producer_bind_helper(pulsar_d3d11_return_producer_t *producer, HANDLE helper_process);
 bool pulsar_d3d11_return_producer_ready(pulsar_d3d11_return_producer_t *producer);
 bool pulsar_d3d11_return_producer_write(pulsar_d3d11_return_producer_t *producer, uint8_t **data,
 						uint32_t *linesize, uint64_t timestamp,

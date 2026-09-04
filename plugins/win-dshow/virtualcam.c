@@ -9,6 +9,7 @@
 #include "util/threading.h"
 #include "../../shared/obs-shared-memory-queue/shared-memory-queue.h"
 #include "directshow-namespace.h"
+#include "virtualcam-module/d3d11-return-auth.h"
 #include "virtualcam-module/d3d11-return-transport.hpp"
 #include "../../../plugins/pulsar-frontend-stub/include/pulsar-runtime-telemetry-abi.h"
 
@@ -29,6 +30,16 @@ struct virtualcam_data {
 	wchar_t consumer_lease_name[288];
 	wchar_t consumer_registration_pipe_name[256];
 	HANDLE consumer_registration_pipe;
+	HANDLE helper_process;
+	HANDLE helper_bootstrap_pipe;
+	HANDLE helper_frame_pipe;
+	pthread_t helper_thread;
+	volatile long helper_stop;
+	volatile long helper_failed;
+	volatile long helper_thread_started;
+	bool helper_authenticated;
+	uint32_t helper_width;
+	uint32_t helper_height;
 	bool queue_namespace_rejected;
 	bool program_return;
 	bool preview_return;
@@ -112,6 +123,233 @@ static bool return_consumer_registration_pipe_start(struct virtualcam_data *vcam
 	return vcam->consumer_registration_pipe != INVALID_HANDLE_VALUE;
 }
 
+static bool return_helper_path(wchar_t *path, size_t capacity)
+{
+	HMODULE module = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					(LPCWSTR)(uintptr_t)&return_helper_path, &module))
+		return false;
+	DWORD length = GetModuleFileNameW(module, path, (DWORD)capacity);
+	if (!length || length >= capacity)
+		return false;
+	wchar_t *separator = wcsrchr(path, L'\\');
+	if (!separator)
+		return false;
+#ifdef _WIN64
+	const wchar_t *helper_name = L"pulsar-d3d11-return-helper64.exe";
+#else
+	const wchar_t *helper_name = L"pulsar-d3d11-return-helper32.exe";
+#endif
+	if ((size_t)(separator - path) + 1 + wcslen(helper_name) + 1 > capacity)
+		return false;
+	separator[1] = L'\0';
+	wcscat_s(path, capacity, helper_name);
+	return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool return_helper_image_matches(HANDLE process, const wchar_t *expected_path)
+{
+	wchar_t observed_path[MAX_PATH] = {0};
+	DWORD length = ARRAYSIZE(observed_path);
+	return process && expected_path && QueryFullProcessImageNameW(process, 0, observed_path, &length) &&
+		_wcsicmp(observed_path, expected_path) == 0;
+}
+
+static void return_helper_close(struct virtualcam_data *vcam)
+{
+	if (!vcam)
+		return;
+	os_atomic_set_long(&vcam->helper_stop, 1);
+	if (vcam->helper_process) {
+		TerminateProcess(vcam->helper_process, ERROR_CANCELLED);
+		WaitForSingleObject(vcam->helper_process, 2000);
+		CloseHandle(vcam->helper_process);
+		vcam->helper_process = NULL;
+	}
+	if (vcam->helper_bootstrap_pipe && vcam->helper_bootstrap_pipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(vcam->helper_bootstrap_pipe);
+		vcam->helper_bootstrap_pipe = INVALID_HANDLE_VALUE;
+	}
+	if (vcam->helper_frame_pipe && vcam->helper_frame_pipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(vcam->helper_frame_pipe);
+		vcam->helper_frame_pipe = INVALID_HANDLE_VALUE;
+	}
+	if (os_atomic_load_long(&vcam->helper_thread_started)) {
+		pthread_join(vcam->helper_thread, NULL);
+		os_atomic_set_long(&vcam->helper_thread_started, 0);
+	}
+	vcam->helper_authenticated = false;
+}
+
+static void *return_helper_frame_reader(void *param)
+{
+	struct virtualcam_data *vcam = (struct virtualcam_data *)param;
+	const size_t frame_size = (size_t)vcam->helper_width * vcam->helper_height * 3 / 2;
+	uint8_t *frame = bmalloc(frame_size);
+	if (!frame) {
+		os_atomic_set_long(&vcam->helper_failed, 1);
+		return NULL;
+	}
+	while (!os_atomic_load_long(&vcam->helper_stop)) {
+		struct pulsar_return_auth_frame envelope = {0};
+		if (!pulsar_return_auth_read(vcam->helper_frame_pipe, &envelope, sizeof(envelope)))
+			break;
+		if (envelope.magic != PULSAR_RETURN_AUTH_FRAME_MAGIC || envelope.version != PULSAR_RETURN_AUTH_VERSION ||
+			envelope.width != vcam->helper_width || envelope.height != vcam->helper_height ||
+			envelope.payload_size != frame_size ||
+			!pulsar_return_auth_read(vcam->helper_frame_pipe, frame, frame_size)) {
+			os_atomic_set_long(&vcam->helper_failed, 1);
+			break;
+		}
+		if (vcam->vq && os_atomic_load_bool(&vcam->active)) {
+			uint8_t *planes[2] = {frame, frame + (size_t)vcam->helper_width * vcam->helper_height};
+			uint32_t linesize[2] = {vcam->helper_width, vcam->helper_width};
+			struct video_queue_frame_metadata metadata = {0};
+			memcpy(&metadata, envelope.metadata, sizeof(metadata));
+			(void)video_queue_write_ex(vcam->vq, planes, linesize, envelope.timestamp,
+						   VIDEO_QUEUE_PIXEL_FORMAT_NV12, &metadata);
+		}
+	}
+	if (!os_atomic_load_long(&vcam->helper_stop))
+		os_atomic_set_long(&vcam->helper_failed, 1);
+	bfree(frame);
+	return NULL;
+}
+
+static bool return_helper_start(struct virtualcam_data *vcam, uint32_t width, uint32_t height, uint64_t interval)
+{
+	if (!vcam || !vcam->d3d11 || vcam->helper_process)
+		return false;
+	HANDLE child_read = NULL;
+	HANDLE parent_write = NULL;
+	HANDLE parent_read = NULL;
+	HANDLE child_write = NULL;
+	STARTUPINFOEXW startup = {0};
+	PROCESS_INFORMATION process = {0};
+	bool attribute_initialized = false;
+	SECURITY_ATTRIBUTES attributes = {sizeof(attributes), NULL, TRUE};
+	if (!CreatePipe(&child_read, &parent_write, &attributes, 0) ||
+		!CreatePipe(&parent_read, &child_write, &attributes, 0))
+		goto failed;
+	if (!SetHandleInformation(parent_write, HANDLE_FLAG_INHERIT, 0) ||
+		!SetHandleInformation(parent_read, HANDLE_FLAG_INHERIT, 0))
+		goto failed;
+
+	startup.StartupInfo.cb = sizeof(startup);
+	startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+	startup.StartupInfo.wShowWindow = SW_HIDE;
+	SIZE_T attribute_size = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_size);
+	startup.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attribute_size);
+	if (!startup.lpAttributeList || !InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attribute_size))
+		goto failed;
+	attribute_initialized = true;
+	HANDLE inherited[2] = {child_read, child_write};
+	if (!UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+					       sizeof(inherited), NULL, NULL))
+		goto failed;
+	wchar_t helper_path[MAX_PATH] = {0};
+	if (!return_helper_path(helper_path, ARRAYSIZE(helper_path)))
+		goto failed;
+	wchar_t command_line[1024] = {0};
+	_snwprintf_s(command_line, ARRAYSIZE(command_line), _TRUNCATE,
+			     L"\"%ls\" --read-handle=%llu --write-handle=%llu", helper_path,
+			     (unsigned long long)(uintptr_t)child_read, (unsigned long long)(uintptr_t)child_write);
+	if (!CreateProcessW(helper_path, command_line, NULL, NULL, TRUE,
+				CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+				&startup.StartupInfo, &process))
+		goto failed;
+	DeleteProcThreadAttributeList(startup.lpAttributeList);
+	HeapFree(GetProcessHeap(), 0, startup.lpAttributeList);
+	startup.lpAttributeList = NULL;
+	attribute_initialized = false;
+	CloseHandle(child_read);
+	CloseHandle(child_write);
+	child_read = child_write = NULL;
+	CloseHandle(process.hThread);
+	if (!return_helper_image_matches(process.hProcess, helper_path))
+		goto failed_process;
+
+	struct pulsar_return_auth_bootstrap bootstrap = {0};
+	bootstrap.magic = PULSAR_RETURN_AUTH_MAGIC;
+	bootstrap.version = PULSAR_RETURN_AUTH_VERSION;
+	bootstrap.lane = vcam->program_return ? PULSAR_D3D11_PROGRAM_RETURN : PULSAR_D3D11_PREVIEW_RETURN;
+	bootstrap.width = width;
+	bootstrap.height = height;
+	bootstrap.interval = interval;
+	wcsncpy_s(bootstrap.queue_name, ARRAYSIZE(bootstrap.queue_name), vcam->queue_name, _TRUNCATE);
+	if (!pulsar_return_auth_random(bootstrap.generation, sizeof(bootstrap.generation)) ||
+		!pulsar_return_auth_random(bootstrap.capability, sizeof(bootstrap.capability)) ||
+		!pulsar_return_auth_write(parent_write, &bootstrap, sizeof(bootstrap))) {
+		TerminateProcess(process.hProcess, ERROR_ACCESS_DENIED);
+		CloseHandle(process.hProcess);
+		CloseHandle(parent_write);
+		CloseHandle(parent_read);
+		return false;
+	}
+	struct pulsar_return_auth_hello hello = {0};
+	if (!pulsar_return_auth_read(parent_read, &hello, sizeof(hello)) || hello.magic != PULSAR_RETURN_AUTH_MAGIC ||
+		hello.version != PULSAR_RETURN_AUTH_VERSION || hello.lane != bootstrap.lane ||
+		!pulsar_return_auth_equal(hello.generation, bootstrap.generation, sizeof(hello.generation)))
+		goto failed_process;
+	struct pulsar_return_auth_challenge challenge = {0};
+	challenge.magic = PULSAR_RETURN_AUTH_MAGIC;
+	challenge.version = PULSAR_RETURN_AUTH_VERSION;
+	challenge.lane = bootstrap.lane;
+	memcpy(challenge.generation, bootstrap.generation, sizeof(challenge.generation));
+	if (!pulsar_return_auth_random(challenge.nonce, sizeof(challenge.nonce)) ||
+		!pulsar_return_auth_write(parent_write, &challenge, sizeof(challenge)))
+		goto failed_process;
+	struct pulsar_return_auth_proof proof = {0};
+	uint8_t expected[PULSAR_RETURN_AUTH_NONCE_BYTES] = {0};
+	if (!pulsar_return_auth_read(parent_read, &proof, sizeof(proof)) || proof.magic != PULSAR_RETURN_AUTH_MAGIC ||
+		proof.version != PULSAR_RETURN_AUTH_VERSION || proof.lane != bootstrap.lane ||
+		!pulsar_return_auth_equal(proof.generation, bootstrap.generation, sizeof(proof.generation)) ||
+		!pulsar_return_auth_make_proof(bootstrap.capability, &hello, &challenge, expected) ||
+		!pulsar_return_auth_equal(proof.mac, expected, sizeof(expected)))
+		goto failed_process;
+	if (!pulsar_d3d11_return_producer_bind_helper(vcam->d3d11, process.hProcess))
+		goto failed_process;
+	vcam->helper_process = process.hProcess;
+	vcam->helper_bootstrap_pipe = parent_write;
+	vcam->helper_frame_pipe = parent_read;
+	vcam->helper_width = width;
+	vcam->helper_height = height;
+	vcam->helper_authenticated = true;
+	os_atomic_set_long(&vcam->helper_stop, 0);
+	os_atomic_set_long(&vcam->helper_failed, 0);
+	if (pthread_create(&vcam->helper_thread, NULL, return_helper_frame_reader, vcam) != 0) {
+		return_helper_close(vcam);
+		return false;
+	}
+	os_atomic_set_long(&vcam->helper_thread_started, 1);
+	return true;
+
+failed_process:
+	TerminateProcess(process.hProcess, ERROR_ACCESS_DENIED);
+	CloseHandle(process.hProcess);
+	CloseHandle(parent_write);
+	CloseHandle(parent_read);
+	return false;
+
+failed:
+	if (startup.lpAttributeList) {
+		if (attribute_initialized)
+			DeleteProcThreadAttributeList(startup.lpAttributeList);
+		HeapFree(GetProcessHeap(), 0, startup.lpAttributeList);
+	}
+	if (child_read)
+		CloseHandle(child_read);
+	if (child_write)
+		CloseHandle(child_write);
+	if (parent_write)
+		CloseHandle(parent_write);
+	if (parent_read)
+		CloseHandle(parent_read);
+	return false;
+}
+
 static bool return_consumer_process_image_allowed(HANDLE process)
 {
 	wchar_t image_path[MAX_PATH] = {0};
@@ -183,7 +421,7 @@ static bool return_lease_probe_once(struct virtualcam_data *vcam)
 	DWORD registration_pid = 0;
 	const bool registration_live = return_consumer_registration_live(vcam, &registration_pid);
 	bool active = lease_present && registration_live;
-	if (vcam->d3d11) {
+	if (vcam->d3d11 && !vcam->helper_authenticated) {
 		const bool producer_authorized = pulsar_d3d11_return_producer_set_consumer_pid(
 			vcam->d3d11, active ? registration_pid : 0);
 		active = active && producer_authorized;
@@ -425,6 +663,7 @@ static void virtualcam_destroy(void *data)
 	struct virtualcam_data *vcam = (struct virtualcam_data *)data;
 	return_lease_watcher_stop(vcam);
 	return_consumer_registration_pipe_close(vcam);
+	return_helper_close(vcam);
 	pulsar_d3d11_return_producer_close(vcam->d3d11);
 	video_queue_close(vcam->vq);
 	bfree(data);
@@ -440,6 +679,8 @@ static void *virtualcam_create(obs_data_t *settings, obs_output_t *output)
 				       strcmp(obs_output_get_id(output), "preview_return_output") == 0;
 	vcam->consumer_gated = vcam->program_return || vcam->preview_return;
 	vcam->consumer_registration_pipe = INVALID_HANDLE_VALUE;
+	vcam->helper_bootstrap_pipe = INVALID_HANDLE_VALUE;
+	vcam->helper_frame_pipe = INVALID_HANDLE_VALUE;
 	vcam->lease_telemetry_enabled = return_lease_telemetry_enabled();
 	const char *transport = getenv("PULSAR_RETURN_TRANSPORT");
 	vcam->d3d11_requested = vcam->consumer_gated && transport && strcmp(transport, "d3d11") == 0;
@@ -505,6 +746,11 @@ static bool virtualcam_start(void *data)
 		if (!vcam->d3d11)
 			blog(LOG_WARNING, "[pulsar-directshow] D3D11 %s control unavailable; using CPU return queue",
 			     vcam->program_return ? "ProgramReturn" : "PreviewReturn");
+		else if (!return_helper_start(vcam, width, height, interval)) {
+			pulsar_d3d11_return_producer_close(vcam->d3d11);
+			vcam->d3d11 = NULL;
+			blog(LOG_WARNING, "[pulsar-directshow] private D3D11 helper unavailable; using CPU return queue");
+		}
 	}
 	if (!return_lease_watcher_start(vcam))
 		blog(LOG_WARNING, "[pulsar-directshow] %s lease watcher unavailable; publication remains disabled",
@@ -523,6 +769,7 @@ static void virtualcam_deactive(struct virtualcam_data *vcam)
 	os_atomic_set_bool(&vcam->active, false);
 	obs_output_end_data_capture(vcam->output);
 	return_consumer_registration_pipe_close(vcam);
+	return_helper_close(vcam);
 	pulsar_d3d11_return_producer_close(vcam->d3d11);
 	vcam->d3d11 = NULL;
 	video_queue_close(vcam->vq);
@@ -564,13 +811,24 @@ static void virtual_video(void *param, struct video_data *frame)
 	 * no graph actively consumes this return. */
 	if (!return_consumer_is_active(vcam))
 		return;
+	if (vcam->helper_authenticated && os_atomic_load_long(&vcam->helper_failed)) {
+		return_helper_close(vcam);
+		pulsar_d3d11_return_producer_close(vcam->d3d11);
+		vcam->d3d11 = NULL;
+	}
 
 	struct video_queue_frame_metadata metadata;
 	snapshot_runtime_frame(&metadata);
 	const enum video_queue_pixel_format format = queue_pixel_format(vcam->output);
-	if (vcam->d3d11 && format == VIDEO_QUEUE_PIXEL_FORMAT_NV12 &&
-	    pulsar_d3d11_return_producer_write(vcam->d3d11, frame->data, frame->linesize, frame->timestamp, &metadata))
-		return;
+	if (vcam->d3d11 && format == VIDEO_QUEUE_PIXEL_FORMAT_NV12) {
+		const bool published = pulsar_d3d11_return_producer_write(vcam->d3d11, frame->data, frame->linesize,
+									 frame->timestamp, &metadata);
+		/* While the authenticated helper is alive it is the sole CPU-queue
+		 * writer.  A transient GPU timeout must not race its readback relay;
+		 * the next helper failure transitions to the ordinary CPU fallback. */
+		if (published || vcam->helper_authenticated)
+			return;
+	}
 	(void)video_queue_write_ex(vcam->vq, frame->data, frame->linesize, frame->timestamp, format, &metadata);
 }
 

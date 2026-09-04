@@ -24,6 +24,7 @@ endif()
 target_sources(
   win-dshow
   PRIVATE dshow-plugin.cpp encode-dstr.hpp ffmpeg-decode.c ffmpeg-decode.h win-dshow-encoder.cpp win-dshow.cpp
+          virtualcam-module/d3d11-return-auth.c virtualcam-module/d3d11-return-auth.h
           virtualcam-module/d3d11-return-transport.cpp virtualcam-module/d3d11-return-transport.hpp
 )
 
@@ -45,6 +46,8 @@ target_link_libraries(
     winmm
     d3d11
     dxgi
+    bcrypt
+    advapi32
 )
 
 add_subdirectory(virtualcam-module)
