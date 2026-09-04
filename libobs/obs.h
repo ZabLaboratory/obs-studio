@@ -1011,6 +1011,9 @@ EXPORT bool obs_weak_object_references_object(obs_weak_object_t *weak, obs_objec
  */
 EXPORT obs_view_t *obs_view_create(void);
 
+/** Creates a view whose sources stay active as a main-program view. */
+EXPORT obs_view_t *obs_view_create_active(void);
+
 /** Destroys this view context */
 EXPORT void obs_view_destroy(obs_view_t *view);
 

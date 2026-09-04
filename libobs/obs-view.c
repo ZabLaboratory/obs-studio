@@ -34,16 +34,26 @@ bool obs_view_init(struct obs_view *view, enum view_type type)
 	return true;
 }
 
-obs_view_t *obs_view_create(void)
+static obs_view_t *obs_view_create_with_type(enum view_type type)
 {
 	struct obs_view *view = bzalloc(sizeof(struct obs_view));
 
-	if (!obs_view_init(view, AUX_VIEW)) {
+	if (!obs_view_init(view, type)) {
 		bfree(view);
 		view = NULL;
 	}
 
 	return view;
+}
+
+obs_view_t *obs_view_create(void)
+{
+	return obs_view_create_with_type(AUX_VIEW);
+}
+
+obs_view_t *obs_view_create_active(void)
+{
+	return obs_view_create_with_type(MAIN_VIEW);
 }
 
 void obs_view_free(struct obs_view *view)
@@ -245,6 +255,15 @@ void obs_view_apply_pending_atomic_swap(uint64_t frame_id, uint64_t pts_ns)
 	struct obs_source *old_second = swap->second_view->channels[swap->second_channel];
 	struct obs_source *new_first = swap->first_source;
 	struct obs_source *new_second = swap->second_source;
+	/* A dual-lane cut exchanges two already-visible roots: ProgramView is the
+	 * MAIN_VIEW and PreviewView is AUX_VIEW.  The visibility ownership remains
+	 * one view per source, so skip show_refs churn and transfer only the MAIN
+	 * activation ownership.  Generic swaps, including Fade/Stinger, retain the
+	 * original activate/deactivate path below. */
+	const bool preserve_active_pair =
+		old_first && old_second && new_first && new_second && old_first != old_second &&
+		new_first == old_second && new_second == old_first &&
+		swap->first_view->type == MAIN_VIEW && swap->second_view->type == AUX_VIEW;
 	/* The references acquired by queue_atomic_swap now belong to the views. */
 	swap->first_source = NULL;
 	swap->second_source = NULL;
@@ -254,16 +273,22 @@ void obs_view_apply_pending_atomic_swap(uint64_t frame_id, uint64_t pts_ns)
 	pthread_mutex_unlock(&swap->first_view->channels_mutex);
 	pthread_mutex_unlock(&swap->second_view->channels_mutex);
 
-	if (new_first)
-		obs_source_activate(new_first, swap->first_view->type);
-	if (new_second)
-		obs_source_activate(new_second, swap->second_view->type);
+	if (preserve_active_pair) {
+		obs_source_transfer_main_activation(old_first, new_first);
+	} else {
+		if (new_first)
+			obs_source_activate(new_first, swap->first_view->type);
+		if (new_second)
+			obs_source_activate(new_second, swap->second_view->type);
+	}
 	if (old_first) {
-		obs_source_deactivate(old_first, swap->first_view->type);
+		if (!preserve_active_pair)
+			obs_source_deactivate(old_first, swap->first_view->type);
 		obs_source_release(old_first);
 	}
 	if (old_second) {
-		obs_source_deactivate(old_second, swap->second_view->type);
+		if (!preserve_active_pair)
+			obs_source_deactivate(old_second, swap->second_view->type);
 		obs_source_release(old_second);
 	}
 

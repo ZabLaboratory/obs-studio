@@ -1189,6 +1189,8 @@ static inline enum gs_color_space convert_video_space(enum video_format format, 
 extern void obs_source_set_texcoords_centered(obs_source_t *source, bool centered);
 extern void obs_source_activate(obs_source_t *source, enum view_type type);
 extern void obs_source_deactivate(obs_source_t *source, enum view_type type);
+/* Transfer only MAIN_VIEW activation between two already-visible sources. */
+extern void obs_source_transfer_main_activation(obs_source_t *old_source, obs_source_t *new_source);
 extern void obs_source_video_tick(obs_source_t *source, float seconds);
 extern float obs_source_get_target_volume(obs_source_t *source, obs_source_t *target);
 extern uint64_t obs_source_get_last_async_ts(const obs_source_t *source);
