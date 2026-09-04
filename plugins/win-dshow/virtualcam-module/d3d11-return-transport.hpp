@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define PULSAR_D3D11_RETURN_SLOT_COUNT 3U
-#define PULSAR_D3D11_RETURN_ABI_VERSION 1U
+#define PULSAR_D3D11_RETURN_ABI_VERSION 2U
 #define PULSAR_D3D11_RETURN_WIDTH 1920U
 #define PULSAR_D3D11_RETURN_HEIGHT 1080U
 #define PULSAR_D3D11_RETURN_IDENTIFIER_CAPACITY 129U
@@ -106,6 +106,7 @@ struct video_queue_frame_metadata;
 pulsar_d3d11_return_producer_t *pulsar_d3d11_return_producer_create(
 	const wchar_t *control_name, enum pulsar_d3d11_return_lane lane, uint32_t width, uint32_t height);
 void pulsar_d3d11_return_producer_close(pulsar_d3d11_return_producer_t *producer);
+bool pulsar_d3d11_return_producer_set_consumer_pid(pulsar_d3d11_return_producer_t *producer, uint32_t pid);
 bool pulsar_d3d11_return_producer_ready(pulsar_d3d11_return_producer_t *producer);
 bool pulsar_d3d11_return_producer_write(pulsar_d3d11_return_producer_t *producer, uint8_t **data,
 						uint32_t *linesize, uint64_t timestamp,

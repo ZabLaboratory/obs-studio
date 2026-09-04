@@ -125,8 +125,10 @@ static bool return_consumer_process_image_allowed(HANDLE process)
 	       _wcsicmp(image_name, L"electron.exe") == 0 || _wcsicmp(image_name, L"prism.exe") == 0;
 }
 
-static bool return_consumer_registration_live(struct virtualcam_data *vcam)
+static bool return_consumer_registration_live(struct virtualcam_data *vcam, DWORD *client_pid)
 {
+	if (client_pid)
+		*client_pid = 0;
 	if (!vcam->consumer_registration_pipe || vcam->consumer_registration_pipe == INVALID_HANDLE_VALUE)
 		return false;
 	BOOL connected = ConnectNamedPipe(vcam->consumer_registration_pipe, NULL);
@@ -160,8 +162,11 @@ static bool return_consumer_registration_live(struct virtualcam_data *vcam)
 			  WaitForSingleObject(process, 0) == WAIT_TIMEOUT && return_consumer_process_image_allowed(process);
 	if (process)
 		CloseHandle(process);
-	if (live)
+	if (live) {
+		if (client_pid)
+			*client_pid = pid;
 		return true;
+	}
 	return_consumer_registration_pipe_close(vcam);
 	(void)return_consumer_registration_pipe_start(vcam);
 	return false;
@@ -175,8 +180,14 @@ static bool return_lease_probe_once(struct virtualcam_data *vcam)
 	const DWORD probe_error = lease_present ? ERROR_SUCCESS : GetLastError();
 	if (lease)
 		CloseHandle(lease);
-	const bool registration_live = return_consumer_registration_live(vcam);
-	const bool active = lease_present && registration_live;
+	DWORD registration_pid = 0;
+	const bool registration_live = return_consumer_registration_live(vcam, &registration_pid);
+	bool active = lease_present && registration_live;
+	if (vcam->d3d11) {
+		const bool producer_authorized = pulsar_d3d11_return_producer_set_consumer_pid(
+			vcam->d3d11, active ? registration_pid : 0);
+		active = active && producer_authorized;
+	}
 
 	if (active) {
 		InterlockedIncrement(&vcam->lease_hits);
