@@ -1,79 +1,62 @@
 @echo off
 @cd /d "%~dp0"
-goto checkAdmin
+setlocal EnableDelayedExpansion
+set "OBS_VCAM_CLSID={@VIRTUALCAM_GUID@}"
+set "PROGRAM_RETURN_CLSID={8C4E159D-3F60-4A42-9A6D-7F3A5B21E490}"
+set "PREVIEW_RETURN_CLSID={8C4E159D-3F60-4A42-9A6D-7F3A5B21E491}"
+set "VIDEO_INPUT_CATEGORY={860BB310-5D01-11D0-BD3B-00A0C911CE86}"
+
+set "VCAM32=%~dp0obs-virtualcam-module32.dll"
+if not exist "%VCAM32%" set "VCAM32=%~dp0data\obs-plugins\win-dshow\obs-virtualcam-module32.dll"
+set "VCAM64=%~dp0obs-virtualcam-module64.dll"
+if not exist "%VCAM64%" set "VCAM64=%~dp0data\obs-plugins\win-dshow\obs-virtualcam-module64.dll"
 
 :checkAdmin
 	net session >nul 2>&1
-	if %errorLevel% == 0 (
-		echo.
-	) else (
+	if not %errorLevel% == 0 (
 		echo Administrative rights are required, please re-run this script as Administrator.
-		goto end
+		exit /b 1
 	)
 
-:checkDLL
-	echo Checking for 32-bit Virtual Cam registration...
-	reg query "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\{@VIRTUALCAM_GUID@}" >nul 2>&1
-	if %errorLevel% == 0 (
-		echo 32-bit Virtual Cam found, skipping install...
-		echo.
-	) else (
-		echo 32-bit Virtual Cam not found, installing...
-		goto install32DLL
-	)
+if not exist "%VCAM32%" (
+	echo 32-bit Virtual Cam module is missing: "%VCAM32%"
+	exit /b 1
+)
+if not exist "%VCAM64%" (
+	echo 64-bit Virtual Cam module is missing: "%VCAM64%"
+	exit /b 1
+)
 
-:CheckDLLContinue
-	echo Checking for 64-bit Virtual Cam registration...
-	reg query "HKLM\SOFTWARE\Classes\CLSID\{@VIRTUALCAM_GUID@}" >nul 2>&1
-	if %errorLevel% == 0 (
-		echo 64-bit Virtual Cam found, skipping install...
-		echo.
-	) else (
-		echo 64-bit Virtual Cam not found, installing...
-		goto install64DLL
-	)
-	goto endSuccess
+echo Registering the exact 32-bit Virtual Cam module...
+%SystemRoot%\SysWOW64\regsvr32.exe /i /s "%VCAM32%"
+if not %errorLevel% == 0 exit /b 1
 
-:install32DLL
-	echo Installing 32-bit Virtual Cam...
-	if exist "%~dp0\data\obs-plugins\win-dshow\obs-virtualcam-module32.dll" (
-		regsvr32.exe /i /s "%~dp0\data\obs-plugins\win-dshow\obs-virtualcam-module32.dll"
-	) else (
-		regsvr32.exe /i /s obs-virtualcam-module32.dll
-	)
-	reg query "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\{@VIRTUALCAM_GUID@}" >nul 2>&1
-	if %errorLevel% == 0 (
-		echo 32-bit Virtual Cam successfully installed
-		echo.
-	) else (
-		echo 32-bit Virtual Cam installation failed
-		echo.
-		goto end
-	)
-	goto checkDLLContinue
+echo Registering the exact 64-bit Virtual Cam module...
+%SystemRoot%\System32\regsvr32.exe /i /s "%VCAM64%"
+if not %errorLevel% == 0 exit /b 1
 
-:install64DLL
-	echo Installing 64-bit Virtual Cam...
-	if exist "%~dp0\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll" (
-		regsvr32.exe /i /s "%~dp0\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll"
-	) else (
-		regsvr32.exe /i /s obs-virtualcam-module64.dll
+for %%G in ("%OBS_VCAM_CLSID%" "%PROGRAM_RETURN_CLSID%" "%PREVIEW_RETURN_CLSID%") do (
+	reg query "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\%%~G\InprocServer32" /ve | findstr /I /L /C:"%VCAM32%" >nul
+	if not !errorLevel! == 0 (
+		echo 32-bit Virtual Cam registration verification failed for %%~G
+		exit /b 1
 	)
-	reg query "HKLM\SOFTWARE\Classes\CLSID\{@VIRTUALCAM_GUID@}" >nul 2>&1
-	if %errorLevel% == 0 (
-		echo 64-bit Virtual Cam successfully installed
-		echo.
-		goto endSuccess
-	) else (
-		echo 64-bit Virtual Cam installation failed
-		echo.
-		goto end
+	reg query "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\%VIDEO_INPUT_CATEGORY%\Instance\%%~G" /v FriendlyName >nul 2>&1
+	if not !errorLevel! == 0 (
+		echo 32-bit DirectShow filter registration verification failed for %%~G
+		exit /b 1
 	)
+	reg query "HKLM\SOFTWARE\Classes\CLSID\%%~G\InprocServer32" /ve | findstr /I /L /C:"%VCAM64%" >nul
+	if not !errorLevel! == 0 (
+		echo 64-bit Virtual Cam registration verification failed for %%~G
+		exit /b 1
+	)
+	reg query "HKLM\SOFTWARE\Classes\CLSID\%VIDEO_INPUT_CATEGORY%\Instance\%%~G" /v FriendlyName >nul 2>&1
+	if not !errorLevel! == 0 (
+		echo 64-bit DirectShow filter registration verification failed for %%~G
+		exit /b 1
+	)
+)
 
-:endSuccess
-	echo Virtual Cam installed!
-	echo.
-
-:end
-	pause
-	exit
+echo OBS Virtual Camera and Pulsar return devices registered successfully.
+exit /b 0
