@@ -42,6 +42,27 @@
 #include <obsversion.h>
 #include <caption/caption.h>
 
+/* Pipeline telemetry is updated from graphics, borrowed-video and output
+ * callback threads.  Keep the counters ABI-compatible with the public plain
+ * uint64_t snapshots while making every producer update/read atomic. */
+static inline void obs_pipeline_stats_add_u64(volatile uint64_t *value, uint64_t delta)
+{
+#ifdef _WIN32
+	_InterlockedExchangeAdd64((volatile long long *)value, (long long)delta);
+#else
+	__atomic_fetch_add(value, delta, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline uint64_t obs_pipeline_stats_load_u64(const volatile uint64_t *value)
+{
+#ifdef _WIN32
+	return (uint64_t)_InterlockedCompareExchange64((volatile long long *)value, 0, 0);
+#else
+	return __atomic_load_n(value, __ATOMIC_RELAXED);
+#endif
+}
+
 /* Custom helpers for the UUID hash table */
 #define HASH_FIND_UUID(head, uuid, out) HASH_FIND(hh_uuid, head, uuid, UUID_STR_LENGTH, out)
 #define HASH_ADD_UUID(head, uuid_field, add) HASH_ADD(hh_uuid, head, uuid_field[0], UUID_STR_LENGTH, add)
@@ -50,7 +71,7 @@
 #define NUM_CHANNELS 3
 #define MICROSECOND_DEN 1000000
 #define NUM_ENCODE_TEXTURES 10
-#define NUM_ENCODE_TEXTURE_FRAMES_TO_WAIT 1
+#define NUM_ENCODE_TEXTURE_FRAMES_TO_WAIT 0
 
 static inline int64_t packet_dts_usec(struct encoder_packet *packet)
 {
@@ -281,8 +302,26 @@ struct obs_view {
 	enum view_type type;
 };
 
+/*
+ * A pending pair swap is owned by obs->video until it is either consumed by
+ * the graphics thread or cancelled during video teardown.  The source refs
+ * held here become the corresponding view-channel refs when the swap commits.
+ */
+struct obs_view_atomic_swap {
+	struct obs_view *first_view;
+	uint32_t first_channel;
+	struct obs_source *first_source;
+	struct obs_view *second_view;
+	uint32_t second_channel;
+	struct obs_source *second_source;
+	obs_view_atomic_swap_cb callback;
+	void *callback_param;
+	uint64_t admission_floor_ns;
+};
+
 extern bool obs_view_init(struct obs_view *view, enum view_type type);
 extern void obs_view_free(struct obs_view *view);
+extern void obs_view_apply_pending_atomic_swap(uint64_t frame_id, uint64_t pts_ns);
 
 /* ------------------------------------------------------------------------- */
 /* displays */
@@ -329,6 +368,11 @@ struct obs_task_info {
 	void *param;
 };
 
+struct obs_borrowed_video_callback {
+	void (*callback)(void *param, struct video_data *frame);
+	void *param;
+};
+
 struct obs_core_video_mix {
 	struct obs_view *view;
 
@@ -352,6 +396,15 @@ struct obs_core_video_mix {
 	gs_stagesurf_t *mapped_surfaces[NUM_CHANNELS];
 	int cur_texture;
 	volatile long raw_active;
+	pthread_mutex_t borrowed_video_mutex;
+	pthread_cond_t borrowed_video_cond;
+	pthread_t borrowed_video_thread;
+	DARRAY(struct obs_borrowed_video_callback) borrowed_video_callbacks;
+	struct video_data borrowed_video_frame;
+	bool borrowed_video_initialized;
+	bool borrowed_video_pending;
+	bool borrowed_video_busy;
+	bool borrowed_video_stop;
 	volatile long gpu_encoder_active;
 	bool gpu_was_active;
 	bool raw_was_active;
@@ -381,9 +434,11 @@ struct obs_core_video_mix {
 	long encoder_refs;
 
 	bool mix_audio;
+	struct obs_video_mix_pipeline_stats pipeline_stats;
 };
 
 extern struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi);
+extern struct obs_core_video_mix *obs_create_video_mix_with_cache(struct obs_video_info *ovi, size_t cache_size);
 extern void obs_free_video_mix(struct obs_core_video_mix *video);
 
 struct obs_core_video {
@@ -405,6 +460,7 @@ struct obs_core_video {
 	uint64_t video_frame_interval_ns;
 	uint64_t video_half_frame_interval_ns;
 	uint64_t video_avg_frame_time_ns;
+	struct obs_graphics_pipeline_stats pipeline_stats;
 	double video_fps;
 	pthread_t video_thread;
 	uint32_t total_frames;
@@ -433,6 +489,16 @@ struct obs_core_video {
 
 	pthread_mutex_t mixes_mutex;
 	DARRAY(struct obs_core_video_mix *) mixes;
+
+	/* Exactly one frame-boundary role swap may be pending at a time.  The
+	 * in-flight bit keeps teardown from destroying views while the graphics
+	 * thread is still applying the request or running its callback. */
+	pthread_mutex_t atomic_swap_mutex;
+	pthread_cond_t atomic_swap_cond;
+	bool atomic_swap_initialized;
+	struct obs_view_atomic_swap *pending_atomic_swap;
+	bool atomic_swap_inflight;
+	uint64_t video_frame_id;
 };
 
 extern void add_ready_encoder_group(obs_encoder_t *encoder);
@@ -606,6 +672,10 @@ extern struct obs_core_video_mix *get_mix_for_video(video_t *video);
 extern void start_raw_video(video_t *video, const struct video_scale_info *conversion, uint32_t frame_rate_divisor,
 			    void (*callback)(void *param, struct video_data *frame), void *param);
 extern void stop_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame), void *param);
+extern bool start_borrowed_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				     void *param);
+extern void stop_borrowed_raw_video(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				    void *param);
 
 /* ------------------------------------------------------------------------- */
 /* obs shared context data */
@@ -1119,6 +1189,8 @@ static inline enum gs_color_space convert_video_space(enum video_format format, 
 extern void obs_source_set_texcoords_centered(obs_source_t *source, bool centered);
 extern void obs_source_activate(obs_source_t *source, enum view_type type);
 extern void obs_source_deactivate(obs_source_t *source, enum view_type type);
+/* Transfer only MAIN_VIEW activation between two already-visible sources. */
+extern void obs_source_transfer_main_activation(obs_source_t *old_source, obs_source_t *new_source);
 extern void obs_source_video_tick(obs_source_t *source, float seconds);
 extern float obs_source_get_target_volume(obs_source_t *source, obs_source_t *target);
 extern uint64_t obs_source_get_last_async_ts(const obs_source_t *source);
@@ -1218,6 +1290,8 @@ struct obs_output {
 	DARRAY(struct keyframe_group_data) keyframe_group_tracking;
 	bool received_audio;
 	volatile bool data_active;
+	bool borrowed_video_active;
+	struct obs_raw_output_pipeline_stats raw_pipeline_stats;
 	volatile bool end_data_capture_thread_active;
 	int64_t video_offsets[MAX_OUTPUT_VIDEO_ENCODERS];
 	int64_t audio_offsets[MAX_OUTPUT_AUDIO_ENCODERS];
@@ -1228,6 +1302,7 @@ struct obs_output {
 	pthread_mutex_t interleaved_mutex;
 	DARRAY(struct encoder_packet) interleaved_packets;
 	size_t interleaver_max_batch_size;
+	volatile bool low_latency_interleave;
 	int stop_code;
 
 	int reconnect_retry_sec;

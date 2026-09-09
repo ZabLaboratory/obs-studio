@@ -2204,9 +2204,27 @@ static void apply_ept_offsets(struct obs_output *output)
 static inline size_t count_streamable_frames(struct obs_output *output)
 {
 	size_t eligible = 0;
+	const bool low_latency = os_atomic_load_bool(&output->low_latency_interleave);
 
 	for (size_t idx = 0; idx < output->interleaved_packets.num; idx++) {
 		struct encoder_packet *pkt = &output->interleaved_packets.array[idx];
+
+		/* A low-latency live output may release video as soon as every
+		 * other video track has advanced. Audio remains timestamped and
+		 * interleaved, but its capture/encoder delay no longer blocks a
+		 * Program cut whose audio route did not change. */
+		if (low_latency && pkt->type == OBS_ENCODER_VIDEO) {
+			bool higher_video = true;
+			for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
+				if (!output->video_encoders[i] || i == pkt->track_idx)
+					continue;
+				higher_video = higher_video && output->highest_video_ts[i] > pkt->dts_usec;
+			}
+			if (!higher_video)
+				break;
+			eligible++;
+			continue;
+		}
 
 		/* Only count an interleaved packet as streamable if there are packets of the opposing type and of a
 		 * higher timestamp in the interleave buffer. This ensures that the timestamps are monotonic. */
@@ -2219,6 +2237,22 @@ static inline size_t count_streamable_frames(struct obs_output *output)
 	return eligible;
 }
 
+void obs_output_set_low_latency_interleave(obs_output_t *output, bool enabled)
+{
+	if (!obs_output_valid(output, "obs_output_set_low_latency_interleave"))
+		return;
+
+	os_atomic_set_bool(&output->low_latency_interleave, enabled);
+}
+
+bool obs_output_get_low_latency_interleave(const obs_output_t *output)
+{
+	if (!obs_output_valid(output, "obs_output_get_low_latency_interleave"))
+		return false;
+
+	return os_atomic_load_bool(&output->low_latency_interleave);
+}
+
 static void interleave_packets(void *data, struct encoder_packet *packet, struct encoder_packet_time *packet_time)
 {
 	struct obs_output *output = data;
@@ -2226,6 +2260,7 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	bool was_started;
 	bool received_video;
 	struct encoder_packet_time *output_packet_time = NULL;
+	const uint64_t interleaved_mutex_wait_start = os_gettime_ns();
 
 	if (!active(output))
 		return;
@@ -2233,6 +2268,7 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	packet->track_idx = get_encoder_index(output, packet);
 
 	pthread_mutex_lock(&output->interleaved_mutex);
+	const uint64_t interleaved_mutex_acquired = os_gettime_ns();
 
 	/* if first video frame is not a keyframe, discard until received */
 	if (packet->type == OBS_ENCODER_VIDEO && !output->received_video[packet->track_idx] && !packet->keyframe) {
@@ -2262,12 +2298,17 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 	if (packet_time) {
 		output_packet_time = da_push_back_new(output->encoder_packet_times[packet->track_idx]);
 		*output_packet_time = *packet_time;
+		output_packet_time->interleaved_mutex_wait_start_monotonic_ns = interleaved_mutex_wait_start;
+		output_packet_time->interleaved_mutex_acquired_monotonic_ns = interleaved_mutex_acquired;
 	}
 
 	if (was_started)
 		apply_interleaved_packet_offset(output, &out, output_packet_time);
 	else
 		check_received(output, packet);
+
+	if (output_packet_time)
+		output_packet_time->output_enqueue_monotonic_ns = os_gettime_ns();
 
 	insert_interleaved_packet(output, &out);
 
@@ -2292,7 +2333,13 @@ static void interleave_packets(void *data, struct encoder_packet *packet, struct
 			set_higher_ts(output, &out);
 
 			size_t streamable = count_streamable_frames(output);
-			if (streamable) {
+			if (os_atomic_load_bool(&output->low_latency_interleave)) {
+				/* Every packet counted here already has an opposing packet
+				 * with a higher DTS, so draining the eligible prefix keeps
+				 * timestamps monotonic without retaining a standing queue. */
+				while (streamable--)
+					send_interleaved(output);
+			} else if (streamable) {
 				send_interleaved(output);
 
 				/* If we have more eligible packets queued than we normally should have,
@@ -2328,6 +2375,7 @@ static void default_encoded_callback(void *param, struct encoder_packet *packet,
 static void default_raw_video_callback(void *param, struct video_data *frame)
 {
 	struct obs_output *output = param;
+	const uint64_t callback_start = os_gettime_ns();
 
 	if (video_pause_check(&output->pause, frame->timestamp))
 		return;
@@ -2335,6 +2383,18 @@ static void default_raw_video_callback(void *param, struct video_data *frame)
 	if (data_active(output))
 		output->info.raw_video(output->context.data, frame);
 	output->total_frames++;
+	obs_pipeline_stats_add_u64(&output->raw_pipeline_stats.callback_ns, os_gettime_ns() - callback_start);
+	obs_pipeline_stats_add_u64(&output->raw_pipeline_stats.sample_count, 1);
+}
+
+bool obs_output_get_raw_pipeline_stats(const obs_output_t *output, struct obs_raw_output_pipeline_stats *stats)
+{
+	if (!obs_output_valid(output, "obs_output_get_raw_pipeline_stats") || !stats || flag_encoded(output))
+		return false;
+
+	stats->sample_count = obs_pipeline_stats_load_u64(&output->raw_pipeline_stats.sample_count);
+	stats->callback_ns = obs_pipeline_stats_load_u64(&output->raw_pipeline_stats.callback_ns);
+	return true;
 }
 
 static bool prepare_audio(struct obs_output *output, const struct audio_data *old, struct audio_data *new)
@@ -2485,6 +2545,23 @@ static inline bool preserve_active(struct obs_output *output)
 	return (output->delay_flags & OBS_OUTPUT_DELAY_PRESERVE) != 0;
 }
 
+static bool can_borrow_raw_video(const struct obs_output *output)
+{
+	if (!output->info.raw_video_borrowed || !output->video)
+		return false;
+
+	const struct video_scale_info *conversion = obs_output_get_video_conversion((obs_output_t *)output);
+	const struct video_output_info *native = video_output_get_info(output->video);
+	if (!native)
+		return false;
+	if (!conversion)
+		return true;
+
+	return conversion->format == native->format &&
+	       (!conversion->width || conversion->width == native->width) &&
+	       (!conversion->height || conversion->height == native->height);
+}
+
 static void hook_data_capture(struct obs_output *output)
 {
 	encoded_callback_t encoded_callback;
@@ -2516,9 +2593,14 @@ static void hook_data_capture(struct obs_output *output)
 		if (has_video)
 			start_video_encoders(output, encoded_callback);
 	} else {
-		if (has_video)
-			start_raw_video(output->video, obs_output_get_video_conversion(output), 1,
-					default_raw_video_callback, output);
+		if (has_video) {
+			output->borrowed_video_active = can_borrow_raw_video(output) &&
+							start_borrowed_raw_video(output->video, default_raw_video_callback,
+										 output);
+			if (!output->borrowed_video_active)
+				start_raw_video(output->video, obs_output_get_video_conversion(output), 1,
+						default_raw_video_callback, output);
+		}
 		if (has_audio)
 			start_raw_audio(output);
 	}
@@ -2852,8 +2934,13 @@ static void *end_data_capture_thread(void *data)
 		if (has_audio)
 			stop_audio_encoders(output, encoded_callback);
 	} else {
-		if (has_video)
-			stop_raw_video(output->video, default_raw_video_callback, output);
+		if (has_video) {
+			if (output->borrowed_video_active)
+				stop_borrowed_raw_video(output->video, default_raw_video_callback, output);
+			else
+				stop_raw_video(output->video, default_raw_video_callback, output);
+			output->borrowed_video_active = false;
+		}
 		if (has_audio)
 			stop_raw_audio(output);
 	}

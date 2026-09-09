@@ -2155,6 +2155,63 @@ void device_copy_texture(gs_device_t *device, gs_texture_t *dst, gs_texture_t *s
 	device_copy_texture_region(device, dst, 0, 0, src, 0, 0, 0, 0);
 }
 
+extern "C" EXPORT bool device_copy_texture_from_nt_shared(gs_device_t *device, gs_texture_t *dst, uint32_t handle)
+{
+	try {
+		if (!device)
+			throw "Device is NULL";
+		if (!dst)
+			throw "Destination texture is NULL";
+		if (handle == GS_INVALID_HANDLE)
+			throw "Shared texture handle is invalid";
+		if (dst->type != GS_TEXTURE_2D)
+			throw "Destination texture must be 2D";
+
+		gs_texture_2d *const dst2d = static_cast<gs_texture_2d *>(dst);
+		if (!dst2d->texture)
+			throw "Destination texture resource is NULL";
+
+		ComQIPtr<ID3D11Device1> device1 = device->device;
+		if (!device1)
+			throw "D3D11.1 device is unavailable";
+
+		ComPtr<ID3D11Texture2D> source;
+		const HRESULT hr = device1->OpenSharedResource1((HANDLE)(uintptr_t)handle, __uuidof(ID3D11Texture2D),
+								(void **)source.Assign());
+		if (FAILED(hr))
+			throw HRError("Failed to open NT shared 2D texture", hr);
+
+		D3D11_TEXTURE2D_DESC source_desc;
+		source->GetDesc(&source_desc);
+		D3D11_TEXTURE2D_DESC destination_desc;
+		dst2d->texture->GetDesc(&destination_desc);
+		const gs_color_format source_format = ConvertDXGITextureFormat(source_desc.Format);
+		if (!source_desc.Width || !source_desc.Height || source_format == GS_UNKNOWN)
+			throw "Shared texture has an unsupported format or dimensions";
+		if (source_desc.Width != dst2d->width || source_desc.Height != dst2d->height)
+			throw "Shared and destination texture dimensions do not match";
+		if (destination_desc.Width != source_desc.Width || destination_desc.Height != source_desc.Height)
+			throw "Destination resource dimensions do not match";
+		if (source_desc.ArraySize != 1 || source_desc.MipLevels != 1 || source_desc.SampleDesc.Count != 1)
+			throw "Shared texture has unsupported subresources";
+		if (destination_desc.ArraySize != 1 || destination_desc.MipLevels != 1 ||
+		    destination_desc.SampleDesc.Count != 1 ||
+		    destination_desc.SampleDesc.Quality != source_desc.SampleDesc.Quality)
+			throw "Destination texture has unsupported subresources";
+		if (get_copy_compare_format(source_format) != get_copy_compare_format(dst2d->format))
+			throw "Shared and destination texture formats do not match";
+
+		device->context->CopyResource(dst2d->texture.Get(), source.Get());
+		return true;
+	} catch (const HRError &error) {
+		blog(LOG_DEBUG, "device_copy_texture_from_nt_shared (D3D11): %s (%08lX)", error.str, error.hr);
+	} catch (const char *error) {
+		blog(LOG_DEBUG, "device_copy_texture_from_nt_shared (D3D11): %s", error);
+	}
+
+	return false;
+}
+
 void device_stage_texture(gs_device_t *device, gs_stagesurf_t *dst, gs_texture_t *src)
 {
 	try {

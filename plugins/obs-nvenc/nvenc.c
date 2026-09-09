@@ -314,7 +314,14 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	buf_count = min(64, buf_count);
 	enc->buf_count = buf_count;
 
-	const int output_delay = buf_count - 1;
+	/* ULL deliberately trades asynchronous queue depth for latency.  Keep the
+	 * full surface pool required by the encoder, but synchronously collect the
+	 * first submitted bitstream instead of holding three completed frames in
+	 * OBS before attempting a lock.  Other tuning modes retain the historical
+	 * buf_count - 1 pipeline. */
+	const int output_delay = nv_tuning == NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY
+				 ? max(3, config->frameIntervalP)
+				 : buf_count - 1;
 	enc->output_delay = output_delay;
 
 	if (lookahead) {

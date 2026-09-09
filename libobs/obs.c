@@ -30,7 +30,7 @@ static THREAD_LOCAL bool is_ui_thread = false;
 extern void add_default_module_paths(void);
 extern char *find_libobs_data_file(const char *file);
 
-static inline void make_video_info(struct video_output_info *vi, struct obs_video_info *ovi)
+static inline void make_video_info(struct video_output_info *vi, struct obs_video_info *ovi, size_t cache_size)
 {
 	vi->name = "video";
 	vi->format = ovi->output_format;
@@ -40,7 +40,7 @@ static inline void make_video_info(struct video_output_info *vi, struct obs_vide
 	vi->height = ovi->output_height;
 	vi->range = ovi->range;
 	vi->colorspace = ovi->colorspace;
-	vi->cache_size = 6;
+	vi->cache_size = cache_size;
 }
 
 static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
@@ -602,13 +602,85 @@ static inline void set_video_matrix(struct obs_core_video_mix *video, struct vid
 	memcpy(video->color_matrix, &mat, sizeof(float) * 16);
 }
 
-static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_mix *video)
+static void *borrowed_video_thread(void *data)
+{
+	struct obs_core_video_mix *video = data;
+
+	for (;;) {
+		pthread_mutex_lock(&video->borrowed_video_mutex);
+		while (!video->borrowed_video_pending && !video->borrowed_video_stop)
+			pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+
+		if (video->borrowed_video_stop) {
+			pthread_mutex_unlock(&video->borrowed_video_mutex);
+			break;
+		}
+
+		video->borrowed_video_pending = false;
+		video->borrowed_video_busy = true;
+		const uint64_t publish_start = os_gettime_ns();
+		for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+			struct obs_borrowed_video_callback *cb = &video->borrowed_video_callbacks.array[i];
+			cb->callback(cb->param, &video->borrowed_video_frame);
+		}
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.borrowed_publish_ns,
+					   os_gettime_ns() - publish_start);
+		obs_pipeline_stats_add_u64(&video->pipeline_stats.borrowed_publish_sample_count, 1);
+		video->borrowed_video_busy = false;
+		pthread_cond_broadcast(&video->borrowed_video_cond);
+		pthread_mutex_unlock(&video->borrowed_video_mutex);
+	}
+
+	return NULL;
+}
+
+static bool init_borrowed_video(struct obs_core_video_mix *video)
+{
+	pthread_mutex_init_value(&video->borrowed_video_mutex);
+	if (pthread_mutex_init(&video->borrowed_video_mutex, NULL) != 0)
+		return false;
+	if (pthread_cond_init(&video->borrowed_video_cond, NULL) != 0) {
+		pthread_mutex_destroy(&video->borrowed_video_mutex);
+		pthread_mutex_init_value(&video->borrowed_video_mutex);
+		return false;
+	}
+	if (pthread_create(&video->borrowed_video_thread, NULL, borrowed_video_thread, video) != 0) {
+		pthread_cond_destroy(&video->borrowed_video_cond);
+		pthread_mutex_destroy(&video->borrowed_video_mutex);
+		pthread_mutex_init_value(&video->borrowed_video_mutex);
+		return false;
+	}
+	video->borrowed_video_initialized = true;
+	return true;
+}
+
+static void free_borrowed_video(struct obs_core_video_mix *video)
+{
+	if (!video->borrowed_video_initialized)
+		return;
+
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	while (video->borrowed_video_pending || video->borrowed_video_busy)
+		pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+	video->borrowed_video_stop = true;
+	pthread_cond_broadcast(&video->borrowed_video_cond);
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	pthread_join(video->borrowed_video_thread, NULL);
+
+	da_free(video->borrowed_video_callbacks);
+	pthread_cond_destroy(&video->borrowed_video_cond);
+	pthread_mutex_destroy(&video->borrowed_video_mutex);
+	pthread_mutex_init_value(&video->borrowed_video_mutex);
+	video->borrowed_video_initialized = false;
+}
+
+static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_mix *video, size_t cache_size)
 {
 	struct video_output_info vi;
 
 	pthread_mutex_init_value(&video->gpu_encoder_mutex);
 
-	make_video_info(&vi, ovi);
+	make_video_info(&vi, ovi, cache_size);
 	video->ovi = *ovi;
 
 	/* main view graphics thread drives all frame output,
@@ -651,14 +723,21 @@ static int obs_init_video_mix(struct obs_video_info *ovi, struct obs_core_video_
 		return OBS_VIDEO_FAIL;
 
 	gs_leave_context();
+	if (!init_borrowed_video(video))
+		return OBS_VIDEO_FAIL;
 
 	return OBS_VIDEO_SUCCESS;
 }
 
 struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi)
 {
+	return obs_create_video_mix_with_cache(ovi, 6);
+}
+
+struct obs_core_video_mix *obs_create_video_mix_with_cache(struct obs_video_info *ovi, size_t cache_size)
+{
 	struct obs_core_video_mix *video = bzalloc(sizeof(struct obs_core_video_mix));
-	if (obs_init_video_mix(ovi, video) != OBS_VIDEO_SUCCESS) {
+	if (obs_init_video_mix(ovi, video, cache_size) != OBS_VIDEO_SUCCESS) {
 		bfree(video);
 		video = NULL;
 	}
@@ -698,6 +777,14 @@ static int obs_init_video(struct obs_video_info *ovi)
 		return OBS_VIDEO_FAIL;
 	if (pthread_mutex_init(&video->mixes_mutex, NULL) < 0)
 		return OBS_VIDEO_FAIL;
+	if (pthread_mutex_init(&video->atomic_swap_mutex, NULL) < 0)
+		return OBS_VIDEO_FAIL;
+	if (pthread_cond_init(&video->atomic_swap_cond, NULL) != 0) {
+		pthread_mutex_destroy(&video->atomic_swap_mutex);
+		pthread_mutex_init_value(&video->atomic_swap_mutex);
+		return OBS_VIDEO_FAIL;
+	}
+	video->atomic_swap_initialized = true;
 
 	/* Reset main canvas mix first so it remains first in the rendering order. */
 	if (!obs_canvas_reset_video_internal(obs->data.main_canvas, ovi))
@@ -795,6 +882,7 @@ static void obs_free_render_textures(struct obs_core_video_mix *video)
 
 void obs_free_video_mix(struct obs_core_video_mix *video)
 {
+	free_borrowed_video(video);
 	if (video->video) {
 		video_output_close(video->video);
 		video->video = NULL;
@@ -820,6 +908,10 @@ void obs_free_video_mix(struct obs_core_video_mix *video)
 
 static void obs_free_video(void)
 {
+	/* The graphics thread has already joined in stop_video().  Drop any
+	 * sources retained by a not-yet-consumed Cut before views are destroyed. */
+	obs_view_cancel_atomic_swap();
+
 	pthread_mutex_lock(&obs->video.mixes_mutex);
 	size_t num_views = 0;
 	for (size_t i = 0; i < obs->video.mixes.num; i++) {
@@ -836,6 +928,13 @@ static void obs_free_video(void)
 
 	pthread_mutex_destroy(&obs->video.mixes_mutex);
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
+	if (obs->video.atomic_swap_initialized) {
+		pthread_cond_destroy(&obs->video.atomic_swap_cond);
+		memset(&obs->video.atomic_swap_cond, 0, sizeof(obs->video.atomic_swap_cond));
+		obs->video.atomic_swap_initialized = false;
+	}
+	pthread_mutex_destroy(&obs->video.atomic_swap_mutex);
+	pthread_mutex_init_value(&obs->video.atomic_swap_mutex);
 
 	for (size_t i = 0; i < obs->video.ready_encoder_groups.num; i++) {
 		obs_weak_encoder_release(obs->video.ready_encoder_groups.array[i]);
@@ -1227,6 +1326,7 @@ static bool obs_init(const char *locale, const char *module_config_path, profile
 	pthread_mutex_init_value(&obs->video.task_mutex);
 	pthread_mutex_init_value(&obs->video.encoder_group_mutex);
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
+	pthread_mutex_init_value(&obs->video.atomic_swap_mutex);
 
 	obs->name_store_owned = !store;
 	obs->name_store = store ? store : profiler_name_store_create();
@@ -1822,6 +1922,11 @@ audio_t *obs_get_audio(void)
 video_t *obs_get_video(void)
 {
 	return obs->data.main_canvas->mix->video;
+}
+
+obs_view_t *obs_get_main_view(void)
+{
+	return &obs->data.main_canvas->view;
 }
 
 obs_source_t *obs_get_output_source(uint32_t channel)
@@ -2897,6 +3002,56 @@ uint64_t obs_get_frame_interval_ns(void)
 	return obs->video.video_frame_interval_ns;
 }
 
+bool obs_get_graphics_pipeline_stats(struct obs_graphics_pipeline_stats *stats)
+{
+	if (!obs || !stats)
+		return false;
+	stats->sample_count = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.sample_count);
+	stats->tick_sources_ns = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.tick_sources_ns);
+	stats->output_frames_ns = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.output_frames_ns);
+	stats->render_displays_ns = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.render_displays_ns);
+	stats->graphics_tasks_ns = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.graphics_tasks_ns);
+	stats->frame_total_ns = obs_pipeline_stats_load_u64(&obs->video.pipeline_stats.frame_total_ns);
+	return true;
+}
+
+bool obs_video_get_mix_pipeline_stats(video_t *v, struct obs_video_mix_pipeline_stats *stats)
+{
+	if (!obs || !v || !stats)
+		return false;
+
+	bool found = false;
+	pthread_mutex_lock(&obs->video.mixes_mutex);
+	for (size_t i = 0, num = obs->video.mixes.num; i < num; i++) {
+		struct obs_core_video_mix *mix = obs->video.mixes.array[i];
+		if (mix->video == v) {
+			stats->sample_count = obs_pipeline_stats_load_u64(&mix->pipeline_stats.sample_count);
+			stats->render_submit_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_submit_ns);
+			stats->render_setup_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_setup_ns);
+			stats->render_main_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_main_ns);
+			stats->render_scale_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_scale_ns);
+			stats->render_convert_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_convert_ns);
+			stats->gpu_flush_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.gpu_flush_ns);
+			stats->gpu_encode_submit_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.gpu_encode_submit_ns);
+			stats->raw_stage_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.raw_stage_ns);
+			stats->render_teardown_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.render_teardown_ns);
+			stats->download_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.download_ns);
+			stats->flush_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.flush_ns);
+			stats->output_copy_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.output_copy_ns);
+			stats->borrowed_schedule_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.borrowed_schedule_ns);
+			stats->borrowed_publish_sample_count =
+				obs_pipeline_stats_load_u64(&mix->pipeline_stats.borrowed_publish_sample_count);
+			stats->borrowed_publish_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.borrowed_publish_ns);
+			stats->borrowed_wait_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.borrowed_wait_ns);
+			stats->frame_total_ns = obs_pipeline_stats_load_u64(&mix->pipeline_stats.frame_total_ns);
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&obs->video.mixes_mutex);
+	return found;
+}
+
 enum obs_obj_type obs_obj_get_type(void *obj)
 {
 	struct obs_context_data *context = obj;
@@ -3119,6 +3274,62 @@ void stop_raw_video(video_t *v, void (*callback)(void *param, struct video_data 
 	// https://github.com/obsproject/obs-studio/issues/12366
 	if (video_output_disconnect2(v, callback, param) && video)
 		os_atomic_dec_long(&video->raw_active);
+}
+
+bool start_borrowed_raw_video(video_t *v, void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	struct obs_core_video_mix *video = get_mix_for_video(v);
+	if (!video || !callback || !video->borrowed_video_initialized)
+		return false;
+
+	struct obs_borrowed_video_callback cb = {callback, param};
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+		struct obs_borrowed_video_callback *existing = &video->borrowed_video_callbacks.array[i];
+		if (existing->callback == callback && existing->param == param) {
+			pthread_mutex_unlock(&video->borrowed_video_mutex);
+			return false;
+		}
+	}
+	da_push_back(video->borrowed_video_callbacks, &cb);
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	os_atomic_inc_long(&video->raw_active);
+	return true;
+}
+
+void stop_borrowed_raw_video(video_t *v, void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	struct obs_core_video_mix *video = get_mix_for_video(v);
+	if (!video || !callback || !video->borrowed_video_initialized)
+		return;
+
+	bool removed = false;
+	pthread_mutex_lock(&video->borrowed_video_mutex);
+	while (video->borrowed_video_pending || video->borrowed_video_busy)
+		pthread_cond_wait(&video->borrowed_video_cond, &video->borrowed_video_mutex);
+	for (size_t i = 0; i < video->borrowed_video_callbacks.num; i++) {
+		struct obs_borrowed_video_callback *existing = &video->borrowed_video_callbacks.array[i];
+		if (existing->callback == callback && existing->param == param) {
+			da_erase(video->borrowed_video_callbacks, i);
+			removed = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&video->borrowed_video_mutex);
+	if (removed)
+		os_atomic_dec_long(&video->raw_active);
+}
+
+bool obs_video_add_borrowed_callback(video_t *video, void (*callback)(void *param, struct video_data *frame),
+				     void *param)
+{
+	return start_borrowed_raw_video(video, callback, param);
+}
+
+void obs_video_remove_borrowed_callback(video_t *video, void (*callback)(void *param, struct video_data *frame),
+					void *param)
+{
+	stop_borrowed_raw_video(video, callback, param);
 }
 
 void obs_add_raw_video_callback(const struct video_scale_info *conversion,

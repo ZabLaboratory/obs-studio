@@ -900,6 +900,16 @@ EXPORT void obs_add_raw_video_callback2(const struct video_scale_info *conversio
 					void (*callback)(void *param, struct video_data *frame), void *param);
 EXPORT void obs_remove_raw_video_callback(void (*callback)(void *param, struct video_data *frame), void *param);
 
+/**
+ * Adds/removes a raw callback that borrows the mix's native mapped frame.
+ * The callback runs asynchronously before the staging surface is reused and
+ * must not retain frame pointers.  No scaling or format conversion is done.
+ */
+EXPORT bool obs_video_add_borrowed_callback(video_t *video,
+					    void (*callback)(void *param, struct video_data *frame), void *param);
+EXPORT void obs_video_remove_borrowed_callback(video_t *video,
+					       void (*callback)(void *param, struct video_data *frame), void *param);
+
 EXPORT void obs_add_raw_audio_callback(size_t mix_idx, const struct audio_convert_info *conversion,
 				       audio_output_callback_t callback, void *param);
 EXPORT void obs_remove_raw_audio_callback(size_t mix_idx, audio_output_callback_t callback, void *param);
@@ -909,6 +919,49 @@ EXPORT uint64_t obs_get_video_frame_time(void);
 EXPORT double obs_get_active_fps(void);
 EXPORT uint64_t obs_get_average_frame_time_ns(void);
 EXPORT uint64_t obs_get_frame_interval_ns(void);
+
+/* Cumulative host-CPU timings. Diff two snapshots for an interval average.
+ * Render values cover CPU submission; source-profiler remains authoritative
+ * for GPU execution time. */
+struct obs_graphics_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t tick_sources_ns;
+	uint64_t output_frames_ns;
+	uint64_t render_displays_ns;
+	uint64_t graphics_tasks_ns;
+	uint64_t frame_total_ns;
+};
+
+struct obs_video_mix_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t render_submit_ns;
+	uint64_t render_setup_ns;
+	uint64_t render_main_ns;
+	uint64_t render_scale_ns;
+	uint64_t render_convert_ns;
+	uint64_t gpu_flush_ns;
+	uint64_t gpu_encode_submit_ns;
+	uint64_t raw_stage_ns;
+	uint64_t render_teardown_ns;
+	uint64_t download_ns;
+	uint64_t flush_ns;
+	uint64_t output_copy_ns;
+	uint64_t borrowed_schedule_ns;
+	uint64_t borrowed_publish_sample_count;
+	uint64_t borrowed_publish_ns;
+	uint64_t borrowed_wait_ns;
+	uint64_t frame_total_ns;
+};
+
+struct obs_raw_output_pipeline_stats {
+	uint64_t sample_count;
+	uint64_t callback_ns;
+};
+
+EXPORT bool obs_get_graphics_pipeline_stats(struct obs_graphics_pipeline_stats *stats);
+EXPORT bool obs_video_get_mix_pipeline_stats(video_t *video, struct obs_video_mix_pipeline_stats *stats);
+EXPORT bool obs_output_get_raw_pipeline_stats(const obs_output_t *output,
+					      struct obs_raw_output_pipeline_stats *stats);
 
 EXPORT uint32_t obs_get_total_frames(void);
 EXPORT uint32_t obs_get_lagged_frames(void);
@@ -958,6 +1011,9 @@ EXPORT bool obs_weak_object_references_object(obs_weak_object_t *weak, obs_objec
  */
 EXPORT obs_view_t *obs_view_create(void);
 
+/** Creates a view whose sources stay active as a main-program view. */
+EXPORT obs_view_t *obs_view_create_active(void);
+
 /** Destroys this view context */
 EXPORT void obs_view_destroy(obs_view_t *view);
 
@@ -967,6 +1023,45 @@ EXPORT void obs_view_set_source(obs_view_t *view, uint32_t channel, obs_source_t
 /** Gets the source currently in use for this view context */
 EXPORT obs_source_t *obs_view_get_source(obs_view_t *view, uint32_t channel);
 
+/**
+ * Callback invoked on the graphics thread after a queued pair swap has been
+ * applied at a video frame boundary.
+ *
+ * `frame_id` identifies the frame whose render observes the new pair and
+ * `pts_ns` is the libobs video timestamp for that boundary.
+ */
+typedef void (*obs_view_atomic_swap_cb)(void *param, uint64_t frame_id, uint64_t pts_ns);
+
+/**
+ * Queue an atomic source swap with an immutable monotonic admission floor.
+ * Frames whose `pts_ns` is below the floor leave the request pending.
+ */
+EXPORT bool obs_view_queue_atomic_swap_with_floor(obs_view_t *first_view, uint32_t first_channel,
+                                       obs_source_t *first_source, obs_view_t *second_view,
+                                       uint32_t second_channel, obs_source_t *second_source,
+                                       uint64_t admission_floor_ns,
+                                       obs_view_atomic_swap_cb callback, void *param);
+
+/**
+ * Queue an atomic source swap for two independent view channels.
+ *
+ * The two channels are replaced together immediately before a graphics frame
+ * is rendered.  At most one swap may be pending; a successor may be queued
+ * after the graphics thread detaches the prior request, even while its
+ * completion callback is still unwinding.  The queued sources are referenced
+ * until the swap is applied or cancelled.
+ */
+EXPORT bool obs_view_queue_atomic_swap(obs_view_t *first_view, uint32_t first_channel,
+                                       obs_source_t *first_source, obs_view_t *second_view,
+                                       uint32_t second_channel, obs_source_t *second_source,
+                                       obs_view_atomic_swap_cb callback, void *param);
+
+/** Cancel the pending pair swap, if any, without changing either view. */
+EXPORT void obs_view_cancel_atomic_swap(void);
+
+/** Returns the non-owning main OBS view used by obs_get_video(). */
+EXPORT obs_view_t *obs_get_main_view(void);
+
 /** Renders the sources of this view context */
 EXPORT void obs_view_render(obs_view_t *view);
 
@@ -975,6 +1070,9 @@ EXPORT video_t *obs_view_add(obs_view_t *view);
 
 /** Adds a view to the main render loop, with custom video settings */
 EXPORT video_t *obs_view_add2(obs_view_t *view, struct obs_video_info *ovi);
+
+/** Adds a view with custom video settings and frame cache depth. */
+EXPORT video_t *obs_view_add3(obs_view_t *view, struct obs_video_info *ovi, size_t cache_size);
 
 /** Removes a view from the main render loop */
 EXPORT void obs_view_remove(obs_view_t *view);
@@ -1934,6 +2032,19 @@ EXPORT void obs_output_stop(obs_output_t *output);
  * activated.
  */
 EXPORT void obs_output_set_delay(obs_output_t *output, uint32_t delay_sec, uint32_t flags);
+
+/**
+ * Enables low-latency packet interleaving for an encoded output.
+ *
+ * The default interleaver deliberately retains a bounded backlog. Low-latency
+ * mode drains every timestamp-safe packet and allows each video track to
+ * advance without waiting for the audio watermark. Audio remains encoded and
+ * timestamped on its original media timeline; no encoder setting is changed.
+ */
+EXPORT void obs_output_set_low_latency_interleave(obs_output_t *output, bool enabled);
+
+/** Returns whether low-latency packet interleaving is enabled. */
+EXPORT bool obs_output_get_low_latency_interleave(const obs_output_t *output);
 
 /** Gets the currently set delay value, in seconds. */
 EXPORT uint32_t obs_output_get_delay(const obs_output_t *output);

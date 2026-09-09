@@ -1260,6 +1260,24 @@ void obs_source_deactivate(obs_source_t *source, enum view_type type)
 	}
 }
 
+void obs_source_transfer_main_activation(obs_source_t *old_source, obs_source_t *new_source)
+{
+	if (!obs_source_valid(old_source, "obs_source_transfer_main_activation") ||
+	    !obs_source_valid(new_source, "obs_source_transfer_main_activation") || old_source == new_source)
+		return;
+
+	/* A pure dual-lane cut leaves both roots visible in exactly one view.  Only
+	 * MAIN_VIEW activation ownership changes, so show_refs and visibility
+	 * callbacks remain untouched. */
+	if (os_atomic_load_long(&old_source->activate_refs) > 0) {
+		os_atomic_dec_long(&old_source->activate_refs);
+		obs_source_enum_active_tree(old_source, deactivate_tree, NULL);
+	}
+
+	os_atomic_inc_long(&new_source->activate_refs);
+	obs_source_enum_active_tree(new_source, activate_tree, NULL);
+}
+
 static inline struct obs_source_frame *get_closest_frame(obs_source_t *source, uint64_t sys_time);
 
 static void filter_frame(obs_source_t *source, struct obs_source_frame **ref_frame)

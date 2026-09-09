@@ -138,6 +138,10 @@ EXPORT gs_texture_t *device_texture_create_from_iosurface(gs_device_t *device, v
 EXPORT gs_texture_t *device_texture_open_shared(gs_device_t *device, uint32_t handle);
 #endif
 
+#ifdef _WIN32
+EXPORT bool device_copy_texture_from_nt_shared(gs_device_t *device, gs_texture_t *dst, uint32_t handle);
+#endif
+
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__DragonFly__)
 
 EXPORT gs_texture_t *device_texture_create_from_dmabuf(gs_device_t *device, unsigned int width, unsigned int height,

@@ -93,6 +93,16 @@ struct encoder_packet_time {
 	 * and packet interleaving.
 	 */
 	uint64_t pir;
+
+	/* Output/mux enqueue boundary, captured immediately before the packet is
+	 * inserted into the output interleave queue. */
+	uint64_t output_enqueue_monotonic_ns;
+
+	/* Start and acquisition timestamps for the interleaver mutex.  These are
+	 * diagnostic only and use the same monotonic clock as the other pipeline
+	 * stages; they do not alter packet ordering or ownership. */
+	uint64_t interleaved_mutex_wait_start_monotonic_ns;
+	uint64_t interleaved_mutex_acquired_monotonic_ns;
 };
 
 /** Encoder output packet */

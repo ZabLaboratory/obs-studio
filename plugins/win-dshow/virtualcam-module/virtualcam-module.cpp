@@ -74,8 +74,14 @@ STDMETHODIMP VCamFactory::CreateInstance(LPUNKNOWN parent, REFIID, void **p_ptr)
 		return E_NOINTERFACE;
 	}
 
-	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) || IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo)) {
-		*p_ptr = (void *)new VCamFilter(IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo));
+	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) || IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo) ||
+	    IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo)) {
+		enum directshow_consumer_filter_kind filter_kind = DIRECTSHOW_CONSUMER_FILTER_STOCK;
+		if (IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo))
+			filter_kind = DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN;
+		else if (IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo))
+			filter_kind = DIRECTSHOW_CONSUMER_FILTER_PREVIEW_RETURN;
+		*p_ptr = (void *)new VCamFilter(filter_kind);
 		return S_OK;
 	}
 
@@ -165,8 +171,14 @@ static bool RegServers(bool reg)
 			UnregServer(CLSID_OBS_VirtualVideo);
 			return false;
 		}
+		if (!RegServer(CLSID_PulsarPreviewReturnVideo, L"Pulsar Preview Return", file)) {
+			UnregServer(CLSID_PulsarProgramReturnVideo);
+			UnregServer(CLSID_OBS_VirtualVideo);
+			return false;
+		}
 		return true;
 	} else {
+		UnregServer(CLSID_PulsarPreviewReturnVideo);
 		UnregServer(CLSID_PulsarProgramReturnVideo);
 		return UnregServer(CLSID_OBS_VirtualVideo);
 	}
@@ -202,9 +214,18 @@ static bool RegFilters(bool reg)
 			fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
 			return false;
 		}
+		moniker = nullptr;
+		hr = fm->RegisterFilter(CLSID_PulsarPreviewReturnVideo, L"Pulsar Preview Return", &moniker,
+					&CLSID_VideoInputDeviceCategory, nullptr, &rf2);
+		if (FAILED(hr)) {
+			fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_PulsarProgramReturnVideo);
+			fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
+			return false;
+		}
 	} else {
 		hr = fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
 		fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_PulsarProgramReturnVideo);
+		fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_PulsarPreviewReturnVideo);
 		if (FAILED(hr) && hr != VFW_E_NOT_FOUND)
 			return false;
 	}
@@ -268,7 +289,8 @@ STDAPI DllGetClassObject(REFCLSID cls, REFIID riid, void **p_ptr)
 	if (riid != IID_IClassFactory && riid != IID_IUnknown) {
 		return E_NOINTERFACE;
 	}
-	if (!IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) && !IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo)) {
+	if (!IsEqualCLSID(cls, CLSID_OBS_VirtualVideo) && !IsEqualCLSID(cls, CLSID_PulsarProgramReturnVideo) &&
+	    !IsEqualCLSID(cls, CLSID_PulsarPreviewReturnVideo)) {
 		return E_INVALIDARG;
 	}
 

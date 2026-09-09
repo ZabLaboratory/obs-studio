@@ -3205,6 +3205,17 @@ gs_texture_t *gs_texture_open_nt_shared(uint32_t handle)
 	return NULL;
 }
 
+bool gs_copy_texture_from_nt_shared(gs_texture_t *dst, uint32_t handle)
+{
+	graphics_t *graphics = thread_graphics;
+	if (!gs_valid_p("gs_copy_texture_from_nt_shared", dst))
+		return false;
+
+	if (graphics->exports.device_copy_texture_from_nt_shared)
+		return graphics->exports.device_copy_texture_from_nt_shared(graphics->device, dst, handle);
+	return false;
+}
+
 uint32_t gs_texture_get_shared_handle(gs_texture_t *tex)
 {
 	graphics_t *graphics = thread_graphics;
