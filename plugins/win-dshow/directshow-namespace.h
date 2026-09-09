@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -50,6 +51,61 @@ static inline bool directshow_environment_variable(const char *name, char *value
 	return true;
 }
 
+static inline bool directshow_command_line_switch(const char *name, char *value, size_t capacity)
+{
+	const char *command_line = GetCommandLineA();
+	if (!command_line || !*command_line || !name || !*name || capacity < 2)
+		return false;
+
+	char prefix[128] = {0};
+	const int prefix_length = _snprintf_s(prefix, sizeof(prefix), _TRUNCATE, "--%s=", name);
+	if (prefix_length <= 0)
+		return false;
+
+	for (const char *cursor = command_line; *cursor; ++cursor) {
+		const char previous = cursor == command_line ? ' ' : cursor[-1];
+		if (previous != ' ' && previous != '\t' && previous != '"')
+			continue;
+		if (strncmp(cursor, prefix, (size_t)prefix_length) != 0)
+			continue;
+
+		const char *start = cursor + prefix_length;
+		const char *end = start;
+		while (*end && *end != ' ' && *end != '\t' && *end != '"')
+			++end;
+		const size_t length = (size_t)(end - start);
+		if (length == 0 || length >= capacity) {
+			/* A present but malformed/oversized switch is explicit invalid
+			 * configuration, not permission to fall back to a legacy alias. */
+			value[0] = '!';
+			value[1] = '\0';
+		} else {
+			memcpy(value, start, length);
+			value[length] = '\0';
+		}
+		return true;
+	}
+
+	return false;
+}
+
+static inline bool directshow_runtime_instance_id_value(char *value, size_t capacity)
+{
+	/* An explicit Chromium switch is the host's authoritative value.  This
+	 * protects the consumer from an inherited stale environment block while
+	 * preserving the environment path for the Pulsar producer process. */
+	if (directshow_command_line_switch("pulsar-runtime-instance-id", value, capacity))
+		return true;
+	return directshow_environment_variable("PULSAR_RUNTIME_INSTANCE_ID", value, capacity);
+}
+
+static inline bool directshow_legacy_alias_value(char *value, size_t capacity)
+{
+	if (directshow_command_line_switch("pulsar-directshow-legacy-alias", value, capacity))
+		return true;
+	return directshow_environment_variable("PULSAR_DIRECTSHOW_LEGACY_ALIAS", value, capacity);
+}
+
 static inline bool directshow_runtime_instance_id_valid(const char *value)
 {
 	if (!value || !*value || strlen(value) > 64)
@@ -77,9 +133,9 @@ static inline enum directshow_queue_namespace directshow_queue_namespace_for_con
 	char runtime_id[32768] = {0};
 	char legacy_alias[32768] = {0};
 	const bool runtime_id_present =
-		directshow_environment_variable("PULSAR_RUNTIME_INSTANCE_ID", runtime_id, sizeof(runtime_id));
+		directshow_runtime_instance_id_value(runtime_id, sizeof(runtime_id));
 	const bool legacy_alias_present =
-		directshow_environment_variable("PULSAR_DIRECTSHOW_LEGACY_ALIAS", legacy_alias, sizeof(legacy_alias));
+		directshow_legacy_alias_value(legacy_alias, sizeof(legacy_alias));
 
 	if (runtime_id_present && !directshow_runtime_instance_id_valid(runtime_id))
 		return DIRECTSHOW_QUEUE_NAMESPACE_REJECT;

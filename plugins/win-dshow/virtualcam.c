@@ -639,7 +639,9 @@ static bool queue_name_for_output(obs_output_t *output, wchar_t *destination, si
 		destination[capacity - 1] = 0;
 		return true;
 	}
-	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
+	char runtime_id[65] = {0};
+	if (!directshow_runtime_instance_id_value(runtime_id, sizeof(runtime_id)))
+		return false;
 
 	wchar_t wide_id[65] = {0};
 	/* IDs are validated as ASCII above; avoid a libobs link from this DLL. */
@@ -721,9 +723,10 @@ static bool virtualcam_start(void *data)
 
 	vcam->vq = video_queue_create_named(width, height, interval, vcam->queue_name);
 	if (!vcam->vq) {
-		const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
+		char runtime_id[65] = {0};
+		directshow_runtime_instance_id_value(runtime_id, sizeof(runtime_id));
 		blog(LOG_WARNING, "starting virtual-output failed (queue=%ls runtime_instance_id=%s)",
-		     vcam->queue_name, runtime_id ? runtime_id : "");
+		     vcam->queue_name, runtime_id);
 		return false;
 	}
 	if (vcam->consumer_gated && !return_consumer_registration_pipe_start(vcam)) {

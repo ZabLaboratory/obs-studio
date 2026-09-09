@@ -29,7 +29,8 @@ static std::wstring queue_name_for_filter(enum directshow_queue_namespace queue_
 						   : filter_kind == DIRECTSHOW_CONSUMER_FILTER_PROGRAM_RETURN
 							     ? L"OBSPulsarProgramReturnVideo"
 							     : L"OBSVirtualCamVideo";
-	const char *runtime_id = getenv("PULSAR_RUNTIME_INSTANCE_ID");
+	char runtime_id[65] = {0};
+	directshow_runtime_instance_id_value(runtime_id, sizeof(runtime_id));
 	if (queue_namespace != DIRECTSHOW_QUEUE_NAMESPACE_DEDICATED)
 		return legacy_name;
 
